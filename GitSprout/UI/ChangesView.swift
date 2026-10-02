@@ -16,6 +16,7 @@ struct ChangesView: View {
 struct WorktreeFileList: View {
     var session: WorkspaceSession
     @State private var showCommitComposer = false
+    @State private var showReview = false
     @State private var commitFailure: String?
 
     var body: some View {
@@ -49,6 +50,9 @@ struct WorktreeFileList: View {
         .sheet(isPresented: $showCommitComposer) {
             CommitComposer(session: session, failure: $commitFailure)
         }
+        .sheet(isPresented: $showReview) {
+            StagedReviewSheet(session: session)
+        }
     }
 
     private var sections: [FileSection] {
@@ -60,24 +64,7 @@ struct WorktreeFileList: View {
                 checked: true,
                 trailingDisabled: session.stagedChanges.isEmpty,
                 onTrailing: { Task { await session.unstage(paths: session.stagedChanges.map(\.path)) } },
-                menu: [
-                    SectionMenuItem(
-                        id: "commit",
-                        title: String(localized: "Commit"),
-                        disabled: !session.hasStaged,
-                        shortcut: KeyboardShortcut(.return, modifiers: .command),
-                        action: {
-                            commitFailure = nil
-                            showCommitComposer = true
-                        }
-                    ),
-                    SectionMenuItem(
-                        id: "stash",
-                        title: String(localized: "Stash"),
-                        disabled: session.changeCount == 0,
-                        action: { Task { await session.createStash(message: "") } }
-                    )
-                ]
+                menu: stagedMenu
             ),
             FileSection(
                 id: "unstaged",
@@ -99,6 +86,40 @@ struct WorktreeFileList: View {
         ]
     }
 
+    private var stagedMenu: [SectionMenuItem] {
+        var menu = [
+            SectionMenuItem(
+                id: "commit",
+                title: String(localized: "Commit"),
+                disabled: !session.hasStaged,
+                shortcut: KeyboardShortcut(.return, modifiers: .command),
+                action: {
+                    commitFailure = nil
+                    showCommitComposer = true
+                }
+            )
+        ]
+        if DiffReviewer.isAvailable {
+            menu.append(
+                SectionMenuItem(
+                    id: "review",
+                    title: String(localized: "Brief Review"),
+                    disabled: !session.hasStaged,
+                    action: { showReview = true }
+                )
+            )
+        }
+        menu.append(
+            SectionMenuItem(
+                id: "stash",
+                title: String(localized: "Stash"),
+                disabled: session.changeCount == 0,
+                action: { Task { await session.createStash(message: "") } }
+            )
+        )
+        return menu
+    }
+
     private func listed(_ file: FileChange, staged: Bool) -> ListedFile {
         let kind = staged ? file.staged : file.unstaged
         return ListedFile(
@@ -118,6 +139,8 @@ private struct CommitComposer: View {
     @State private var headMessage: String?
     @State private var loadingHeadMessage = false
     @State private var headMessageLoadID = 0
+    @State private var suggesting = false
+    @State private var showReview = false
 
     init(session: WorkspaceSession, failure: Binding<String?>) {
         self.session = session
@@ -129,6 +152,14 @@ private struct CommitComposer: View {
 
     private var messageIsEmpty: Bool {
         message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canSuggest: Bool {
+        !amend && CommitMessageSuggester.isAvailable
+    }
+
+    private var canReview: Bool {
+        DiffReviewer.isAvailable
     }
 
     var body: some View {
@@ -156,6 +187,18 @@ private struct CommitComposer: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
+                if canSuggest {
+                    Button(suggesting ? "Suggesting…" : "Suggest Message") {
+                        Task { await suggest() }
+                    }
+                    .disabled(suggesting || !session.hasStaged || session.isMutating || loadingHeadMessage)
+                }
+                if canReview {
+                    Button("Brief Review") {
+                        showReview = true
+                    }
+                    .disabled(!session.hasStaged || session.isMutating || loadingHeadMessage)
+                }
                 Spacer()
                 Button("Cancel", role: .cancel) {
                     dismiss()
@@ -169,6 +212,9 @@ private struct CommitComposer: View {
         }
         .padding(20)
         .frame(width: 480)
+        .sheet(isPresented: $showReview) {
+            StagedReviewSheet(session: session)
+        }
     }
 
     @ViewBuilder private var editor: some View {
@@ -184,6 +230,7 @@ private struct CommitComposer: View {
             TextEditor(text: $message)
                 .font(.body)
                 .frame(height: 120)
+                .disabled(suggesting)
                 .overlay {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.3))
@@ -241,6 +288,27 @@ private struct CommitComposer: View {
             failure = (error as? GitFailure)?.message ?? error.localizedDescription
             amend = false
             message = session.commitMessage
+        }
+    }
+
+    private func suggest() async {
+        guard !suggesting, canSuggest, session.hasStaged else { return }
+        suggesting = true
+        defer { suggesting = false }
+        failure = nil
+        do {
+            let diff = try await session.client.stagedDiffText()
+            guard !Task.isCancelled else { return }
+            guard let text = await CommitMessageSuggester.suggest(stagedDiff: diff) else {
+                failure = String(localized: "Couldn't suggest a commit message.")
+                return
+            }
+            guard !Task.isCancelled, !amend else { return }
+            message = text
+        } catch is CancellationError, is GitCancelled {
+            return
+        } catch {
+            failure = (error as? GitFailure)?.message ?? error.localizedDescription
         }
     }
 

@@ -17,7 +17,7 @@ struct GitSproutApp: App {
     }
 
     var body: some Scene {
-        // `WindowGroup` は `open` やフォルダを開くたびにウィンドウを増やす。状態は一つのので、ウィンドウも一つにする。
+        // フォルダを開くたびにウィンドウを増やさない
         Window("GitSprout", id: "main") {
             ContentView(model: model)
                 .preferredColorScheme(colorScheme)

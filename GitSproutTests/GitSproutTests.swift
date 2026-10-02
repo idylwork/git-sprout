@@ -85,6 +85,231 @@ struct RepoChangeTests {
     }
 }
 
+struct CommitMessagePromptTests {
+    @Test func instructionsNameTheLanguage() {
+        #expect(CommitMessagePrompt.instructions(for: .english).contains("English"))
+        #expect(CommitMessagePrompt.instructions(for: .english).contains("what changed"))
+        let japanese = CommitMessagePrompt.instructions(for: .japanese)
+        #expect(japanese.contains("Japanese"))
+        #expect(japanese.contains("what changed"))
+        #expect(japanese.contains("past-tense verb"))
+        let prompt = CommitMessagePrompt.prompt(for: "diff --git a/a b/a\n+one\n", language: .japanese)
+        #expect(prompt?.contains("Japanese") == true)
+        #expect(prompt?.contains("past-tense verb") == false)
+        #expect(prompt?.contains("日本語") == false)
+    }
+
+    @Test func promptSkipsAnEmptyDiff() {
+        #expect(CommitMessagePrompt.prompt(for: " \n") == nil)
+    }
+
+    @Test func diffExcerptCutsOnALineAndMarksTheCut() {
+        let diff = String(repeating: "line\n", count: 40)
+        let excerpt = CommitMessagePrompt.diffExcerpt(diff, limit: 50)
+        #expect(excerpt.contains(CommitMessagePrompt.omittedNote))
+        #expect(!excerpt.contains("line\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline"))
+        #expect(excerpt.split(separator: "\n", omittingEmptySubsequences: false).dropLast(2).allSatisfy { $0 == "line" })
+    }
+
+    @Test func cleanedMessageDropsFencesLabelsAndQuotes() {
+        #expect(CommitMessagePrompt.cleanedMessage("```\nAdd parser\n```") == "Add parser")
+        #expect(CommitMessagePrompt.cleanedMessage("```text\nAdd parser\n```") == "Add parser")
+        #expect(CommitMessagePrompt.cleanedMessage("  \"Add parser\"  ") == "Add parser")
+        #expect(CommitMessagePrompt.cleanedMessage("「パーサーを追加」") == "パーサーを追加")
+        #expect(CommitMessagePrompt.cleanedMessage("Commit message:\nAdd parser") == "Add parser")
+        #expect(CommitMessagePrompt.cleanedMessage("Add \"parser\"") == "Add \"parser\"")
+        #expect(CommitMessagePrompt.cleanedMessage("   ") == nil)
+    }
+
+    @Test func messageDropsACopiedDiffAndKeepsASummary() {
+        let diff = """
+        diff --git a/App.swift b/App.swift
+        @@ -1,3 +1,4 @@
+         func run() {
+        -    return
+        +    start()
+         }
+        """
+        let copied = """
+        func run() {
+            return
+            start()
+        }
+        """
+        #expect(CommitMessagePrompt.looksLikeDiff(diff))
+        #expect(CommitMessagePrompt.message(subject: diff, body: "", diff: diff) == nil)
+        #expect(CommitMessagePrompt.message(subject: copied, body: "", diff: diff) == nil)
+        #expect(CommitMessagePrompt.message(subject: "Start the app", body: diff, diff: diff) == "Start the app")
+        #expect(
+            CommitMessagePrompt.message(subject: "Start the app", body: "Run when the window opens.", diff: diff)
+                == "Start the app\n\nRun when the window opens."
+        )
+    }
+
+    @Test func messageDropsABodyThatRestatesTheSubject() {
+        let diff = "diff --git a/Settings.swift b/Settings.swift\n+language\n"
+        let subject = "設定の言語設定とコミットメッセージの提案機能の追加"
+        let restated = "コミットメッセージの言語設定と設定の言語設定の追加"
+        #expect(CommitMessagePrompt.message(subject: subject, body: restated, diff: diff) == subject)
+        #expect(
+            CommitMessagePrompt.message(subject: subject, body: "設定画面から言語を選べるようにする。", diff: diff)
+                == subject + "\n\n設定画面から言語を選べるようにする。"
+        )
+    }
+}
+
+struct DiffReviewPromptTests {
+    private let sampleDiff = """
+    Sources/Parser.swift | 2 ++
+    1 file changed, 2 insertions(+)
+
+    diff --git a/Sources/Parser.swift b/Sources/Parser.swift
+    @@ -2,4 +2,6 @@
+     struct Parser {
+         func parse() {
+    +        let first = 1
+    +        let second = 2
+             return
+         }
+    """
+
+    private let echoedSummary = "新しい構造を作成しました。総評は差分の内容とコミットの準備状況について2〜3文で記述します。未完成のハンクがあるため、すべての指摘を含めています。"
+
+    @Test func instructionsNameTheLanguage() {
+        #expect(DiffReviewPrompt.instructions(for: .english).contains("English"))
+        #expect(DiffReviewPrompt.instructions(for: .japanese).contains("Japanese"))
+        #expect(DiffReviewPrompt.instructions(for: .english).contains("risk"))
+        #expect(DiffReviewPrompt.instructions(for: .english).contains("Do not name files"))
+        #expect(!DiffReviewPrompt.instructions(for: .english).contains("check disappears"))
+        #expect(!DiffReviewPrompt.instructions(for: .english).contains("one or two sentences"))
+        let prompt = DiffReviewPrompt.prompt(for: sampleDiff, language: .japanese)
+        #expect(prompt?.contains("Japanese") == true)
+        #expect(prompt?.contains("日本語") == false)
+        #expect(prompt?.contains("let first") == true)
+        #expect(prompt?.contains("1 file changed") == true)
+        #expect(prompt?.contains("Sources/Parser.swift") == false)
+        #expect(prompt?.contains("diff --git ") == false)
+    }
+
+    @Test func promptSkipsAnEmptyDiff() {
+        #expect(DiffReviewPrompt.prompt(for: " \n") == nil)
+        #expect(DiffReviewPrompt.parseHunks(" \n").isEmpty)
+    }
+
+    @Test func parseHunksKeepsContextAroundAddedLines() {
+        let hunks = DiffReviewPrompt.parseHunks(sampleDiff)
+        #expect(hunks.count == 1)
+        #expect(hunks[0].changedLines.map(\.text) == ["        let first = 1", "        let second = 2"])
+        #expect(hunks[0].changedLines.map(\.newNumber) == [4, 5])
+        #expect(hunks[0].lines.count == 6)
+    }
+
+    @Test func reviewShowsTheTargetLinesWithOneLineOfContext() {
+        let hunks = DiffReviewPrompt.parseHunks(sampleDiff)
+        let review = DiffReviewPrompt.review(
+            summary: "Parser.swift sets first and second.",
+            comments: [
+                (hunk: 1, line: 4, comment: "This line adds the first marker."),
+                (hunk: 1, line: 5, comment: "This line adds the second marker."),
+                (hunk: 9, line: 4, comment: "This hunk is not in the diff."),
+                (hunk: 1, line: 4, comment: "This line adds the first marker.")
+            ],
+            hunks: hunks
+        )
+        #expect(review?.summary?.contains("first") == true)
+        #expect(review?.findings.count == 1)
+        #expect(review?.findings[0].path == "Sources/Parser.swift")
+        #expect(review?.findings[0].lines.map(\.kind) == [.context, .addition, .addition, .context])
+        #expect(review?.findings[0].lines.map(\.newNumber) == [3, 4, 5, 6])
+        #expect(review?.findings[0].lines.map(\.text) == ["    func parse() {", "        let first = 1", "        let second = 2", "        return"])
+        #expect(review?.findings[0].comment.contains("first marker") == true)
+        #expect(review?.findings[0].comment.contains("second marker") == true)
+
+        let oneLine = DiffReviewPrompt.review(
+            summary: "Parser.swift sets first.",
+            comments: [(hunk: 1, line: 4, comment: "This line adds the first marker.")],
+            hunks: hunks
+        )
+        #expect(oneLine?.findings[0].lines.map(\.newNumber) == [3, 4, 5])
+        #expect(oneLine?.findings[0].lines.map(\.kind) == [.context, .addition, .addition])
+
+        let echoed = DiffReviewPrompt.review(
+            summary: echoedSummary,
+            comments: [(hunk: 1, line: 4, comment: "The first value is now assigned.")],
+            hunks: hunks
+        )
+        #expect(echoed?.summary == nil)
+        #expect(echoed?.findings[0].lines.contains { $0.text.contains("first") } == true)
+        #expect(DiffReviewPrompt.review(summary: echoedSummary, comments: [], hunks: hunks) == nil)
+        let copiedInstructions = """
+        The summary is one or two sentences about what the changed lines do. A finding cites one changed line only when the same hunk also removes or replaces a line.
+
+        Words from this line and from the line it replaces, in Japanese.
+        """
+        #expect(DiffReviewPrompt.review(summary: copiedInstructions, comments: [], hunks: hunks) == nil)
+        #expect(
+            DiffReviewPrompt.review(summary: "パーサーに代入を追加した。", comments: [], hunks: hunks)?.summary
+                == "パーサーに代入を追加した。"
+        )
+        #expect(
+            DiffReviewPrompt.review(summary: "パーサーに代入を追加した。", risk: "なし", comments: [], hunks: hunks)?.risk
+                == nil
+        )
+        #expect(
+            DiffReviewPrompt.review(
+                summary: "パーサーに代入を追加した。",
+                risk: "初期値が固定されたままになる。",
+                comments: [],
+                hunks: hunks
+            )?.risk == "初期値が固定されたままになる。"
+        )
+        #expect(
+            DiffReviewPrompt.review(
+                summary: "パーサーに代入を追加した。",
+                risk: "初期値が固定されたままになる。」}<ctrl46>}",
+                comments: [],
+                hunks: hunks
+            )?.risk == "初期値が固定されたままになる。"
+        )
+        let loopedRisk = String(repeating: "変更の説明が同じ文で繰り返され、新しい内容は増えていない。", count: 2)
+        #expect(
+            DiffReviewPrompt.review(summary: "パーサーに代入を追加した。", risk: loopedRisk, comments: [], hunks: hunks)?.risk
+                == nil
+        )
+        #expect(DiffReviewPrompt.review(summary: "Do not name files or quote code.", comments: [], hunks: hunks) == nil)
+        #expect(
+            DiffReviewPrompt.review(
+                summary: "Parser.swift は新しいチェックが削除され、既存の条件のデフォルトが変更されました。",
+                comments: [],
+                hunks: hunks
+            ) == nil
+        )
+        #expect(
+            DiffReviewPrompt.review(summary: "Parser.swift sets first.", comments: [(hunk: 1, line: 4, comment: "        let first = 1")], hunks: hunks)?
+                .findings.isEmpty == true
+        )
+    }
+
+    @Test func reviewCapsFindings() {
+        let diff = (1...8).map { index in
+            """
+            diff --git a/File\(index).swift b/File\(index).swift
+            @@ -1 +1,2 @@
+             stay
+            +added\(index)
+            """
+        }.joined(separator: "\n")
+        let hunks = DiffReviewPrompt.parseHunks(diff)
+        #expect(hunks.count == 8)
+        #expect(hunks[0].changedLines.map(\.newNumber) == [2])
+        let comments = hunks.map { (hunk: $0.index, line: 2, comment: "File\($0.index) still has added\($0.index).") }
+        let review = DiffReviewPrompt.review(summary: "File1.swift adds added1.", comments: comments, hunks: hunks)
+        #expect(review?.findings.count == DiffReviewPrompt.findingLimit)
+        #expect(review?.findings[0].lines.map(\.text) == ["stay", "added1"])
+        #expect(review?.findings[0].lines.map(\.kind) == [.context, .addition])
+    }
+}
+
 struct LocalizationTests {
     @Test func japaneseOverridesTheEnglishSource() throws {
         let app = Bundle(for: AppModel.self)
@@ -145,7 +370,39 @@ struct ParserTests {
         #expect(commits[0].parents.isEmpty)
         #expect(commits[0].decoration == "main")
         #expect(commits[0].subject == "init")
+        #expect(commits[0].body.isEmpty)
         #expect(commits[0].authoredAt != .distantPast)
+    }
+
+    @Test func logParserReadsTheBodyBelowTheSubject() {
+        let raw = "abc\u{1f}parent\u{1f}T\u{1f}t@example.com\u{1f}2026-09-29T17:54:24+09:00\u{1f}\u{1f}init\u{1f}first line\u{1f}keeps separators\n\nthird\n\u{1e}"
+        let commits = GitLogParser.parse(Data(raw.utf8))
+        #expect(commits.count == 1)
+        #expect(commits[0].subject == "init")
+        #expect(commits[0].body == "first line\u{1f}keeps separators\n\nthird")
+    }
+
+    @Test func commitMessageGetsABlankSecondLine() {
+        #expect(CommitMessageText.insertingBlankSecondLine("subject") == "subject")
+        #expect(CommitMessageText.insertingBlankSecondLine("subject\n\nbody") == "subject\n\nbody")
+        #expect(CommitMessageText.insertingBlankSecondLine("subject\nbody\nmore") == "subject\n\nbody\nmore")
+        #expect(CommitMessageText.insertingBlankSecondLine("subject\r\nbody") == "subject\n\nbody")
+        #expect(CommitMessageText.insertingBlankSecondLine("subject\n  \nbody") == "subject\n\nbody")
+        #expect(CommitMessageText.insertingBlankSecondLine("") == "")
+    }
+
+    @Test func diffTextLinesStayOnTheGutterPitch() {
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let lineHeight = ceil(font.boundingRectForFont.height)
+        let texts = ["alpha", "beta", "", "delta"]
+        let view = DiffColumnTextView()
+        view.frame = NSRect(x: 0, y: 0, width: 420, height: lineHeight * CGFloat(texts.count))
+        view.apply(texts: texts, font: font, lineHeight: lineHeight, width: 420)
+        let origins = view.lineFragmentOrigins()
+        #expect(origins.count == texts.count)
+        for (index, origin) in origins.enumerated() {
+            #expect(abs(origin - CGFloat(index) * lineHeight) < 0.5)
+        }
     }
 
     @Test func diffParserSplitsHunks() {
@@ -726,7 +983,42 @@ struct GitClientTests {
         let page = try await client.log(skip: 0, limit: 5)
         #expect(page.commits.count == 1)
         #expect(page.commits[0].subject == "subject")
+        #expect(page.commits[0].body == "body edited")
         #expect(page.commits[0].parents.isEmpty)
+    }
+
+    @Test func commitSeparatesTheSubjectFromTheBody() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        let client = GitClient(workingDirectory: repo.root.path)
+        try await client.commit(message: "subject\nbody line\nmore", amend: false)
+        #expect(try await client.headCommitMessage() == "subject\n\nbody line\nmore")
+        let page = try await client.log(skip: 0, limit: 1)
+        #expect(page.commits[0].subject == "subject")
+        #expect(page.commits[0].body == "body line\nmore")
+    }
+
+    @Test func stagedDiffTextIncludesOnlyTheIndex() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        let client = GitClient(workingDirectory: repo.root.path)
+        let staged = try await client.stagedDiffText()
+        #expect(staged.contains("hello.txt"))
+        #expect(staged.contains("+one"))
+
+        try repo.git(["commit", "-m", "add"])
+        try "two\n".write(to: file, atomically: true, encoding: .utf8)
+        let unstaged = try await client.stagedDiffText()
+        #expect(unstaged.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+        try repo.git(["add", "hello.txt"])
+        let updated = try await client.stagedDiffText()
+        #expect(updated.contains("+two"))
+        #expect(!updated.contains("+one"))
     }
 
     @Test func pushSendsFastForwardAndOverwritesAfterAmend() async throws {

@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.terminalFontSizeKey) private var terminalFontSize = 13.0
     @AppStorage(AppSettings.stashIncludeUntrackedKey) private var stashIncludeUntracked = true
     @AppStorage(AppSettings.wrapDiffLinesKey) private var wrapDiffLines = false
+    @AppStorage(AppSettings.commitMessageLanguageKey) private var commitMessageLanguage = AppSettings.defaultCommitMessageLanguage.rawValue
 
     var body: some View {
         Form {
@@ -19,6 +20,13 @@ struct SettingsView: View {
                 Toggle("Open Previous Repository on Launch", isOn: $reopenLastRepository)
                 Picker("Appearance", selection: $appearance) {
                     ForEach(AppSettings.Appearance.allCases) { choice in
+                        Text(choice.title).tag(choice.rawValue)
+                    }
+                }
+            }
+            Section("Commit") {
+                Picker("Suggestion Language", selection: $commitMessageLanguage) {
+                    ForEach(CommitMessageLanguage.allCases) { choice in
                         Text(choice.title).tag(choice.rawValue)
                     }
                 }

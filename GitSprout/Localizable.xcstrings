@@ -864,6 +864,17 @@
         }
       }
     },
+    "English" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "英語"
+          }
+        }
+      }
+    },
     "Error" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -893,6 +904,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "このファイルの履歴"
+          }
+        }
+      }
+    },
+    "Japanese" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "日本語"
           }
         }
       }
@@ -1587,6 +1609,39 @@
         }
       }
     },
+    "Suggestion Language" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提案の言語"
+          }
+        }
+      }
+    },
+    "Suggest Message" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "メッセージを提案"
+          }
+        }
+      }
+    },
+    "Suggesting…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提案しています…"
+          }
+        }
+      }
+    },
     "Stashes" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -2078,6 +2133,83 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "直前のコミットを更新できませんでした"
+          }
+        }
+      }
+    },
+    "Couldn't suggest a commit message." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "コミットメッセージを提案できませんでした。"
+          }
+        }
+      }
+    },
+    "Brief Review" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "簡易レビュー"
+          }
+        }
+      }
+    },
+    "Couldn't review the staged changes." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ステージした変更をレビューできませんでした。"
+          }
+        }
+      }
+    },
+    "Reviewing…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "レビューしています…"
+          }
+        }
+      }
+    },
+    "Overview" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "概要"
+          }
+        }
+      }
+    },
+    "Risk" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リスク"
+          }
+        }
+      }
+    },
+    "Couldn't read the staged changes." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ステージした変更を読み取れませんでした"
           }
         }
       }

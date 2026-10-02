@@ -192,6 +192,31 @@ actor GitClient {
         }
     }
 
+    /// ステージ済み差分のテキスト。要約が先、パッチが後。候補の入力に使う。
+    func stagedDiffText() async throws -> String {
+        let stat = try await capture(
+            key: "staged-diff-text",
+            args: ["diff", "--cached", "--find-renames", "--no-ext-diff", "--no-color", "--stat"],
+            limit: 8_000,
+            preempt: true
+        )
+        try requireOK(stat, fallback: String(localized: "Couldn't read the staged changes."))
+        let patch = try await capture(
+            key: "staged-diff-text",
+            args: ["diff", "--cached", "--find-renames", "--no-ext-diff", "--no-color", "-U3"],
+            limit: 12_000,
+            preempt: true
+        )
+        try requireOK(patch, fallback: String(localized: "Couldn't read the staged changes."))
+        let summary = String(decoding: stat.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let changes = String(decoding: patch.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if summary.isEmpty { return changes }
+        if changes.isEmpty { return summary }
+        return summary + "\n\n" + changes
+    }
+
     /// HEAD のメッセージ全文。末尾の改行は除く。
     func headCommitMessage() async throws -> String {
         let output = try await capture(

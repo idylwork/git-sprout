@@ -13,6 +13,7 @@ enum AppSettings {
     static let reopenLastRepositoryKey = "reopenLastRepository"
     static let ignoreWhitespaceKey = "ignoreWhitespace"
     static let wrapDiffLinesKey = "wrapDiffLines"
+    static let commitMessageLanguageKey = "commitMessageLanguage"
 
     enum Appearance: String, CaseIterable, Identifiable {
         case system
@@ -38,6 +39,11 @@ enum AppSettings {
         }
     }
 
+    nonisolated static var defaultCommitMessageLanguage: CommitMessageLanguage {
+        let preferred = Locale.preferredLanguages.first ?? ""
+        return preferred.hasPrefix("ja") ? .japanese : .english
+    }
+
     static func register() {
         UserDefaults.standard.register(defaults: [
             showTerminalButtonKey: true,
@@ -47,6 +53,7 @@ enum AppSettings {
             reopenLastRepositoryKey: true,
             ignoreWhitespaceKey: false,
             wrapDiffLinesKey: false,
+            commitMessageLanguageKey: defaultCommitMessageLanguage.rawValue,
         ])
     }
 
@@ -78,5 +85,24 @@ enum AppSettings {
 
     static var wrapDiffLines: Bool {
         UserDefaults.standard.bool(forKey: wrapDiffLinesKey)
+    }
+
+    nonisolated static var commitMessageLanguage: CommitMessageLanguage {
+        CommitMessageLanguage(rawValue: UserDefaults.standard.string(forKey: commitMessageLanguageKey) ?? "")
+            ?? defaultCommitMessageLanguage
+    }
+}
+
+nonisolated enum CommitMessageLanguage: String, CaseIterable, Identifiable, Sendable {
+    case english
+    case japanese
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .english: String(localized: "English")
+        case .japanese: String(localized: "Japanese")
+        }
     }
 }
