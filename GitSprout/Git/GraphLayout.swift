@@ -190,7 +190,7 @@ nonisolated enum GraphLayout {
         var outgoing: [GraphLane] = []
         var edges: [GraphEdge] = []
         let parents = commit.parents
-        // 同じコミットへ向かう別レーンは、ここでは消さず丸の位置で合流させる。
+        // 同じコミットへ向かう別レーンは、ここでは消さず丸の位置で合流させる
         let joining = incoming.indices.filter { $0 != commitLane && incoming[$0].oid == commit.oid }
 
         if parents.isEmpty {

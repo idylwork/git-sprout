@@ -15,6 +15,13 @@ enum KeyboardTarget: Hashable {
     case fileHistory
 }
 
+/// 一覧の選択。anchor は範囲の固定端、lead は上下キーで動く端。
+nonisolated struct SelectionCursor<ID: Hashable>: Equatable {
+    var selection: Set<ID>
+    var anchor: ID?
+    var lead: ID?
+}
+
 /// 一覧の中で上下に1つ動かす位置。端では止まる。未選択なら下で先頭、上で末尾。
 nonisolated enum SelectionStep {
     static func index<ID: Equatable>(of current: ID?, in items: [ID], delta: Int) -> Int? {
@@ -26,6 +33,50 @@ nonisolated enum SelectionStep {
             start = delta > 0 ? -1 : items.count
         }
         return min(max(0, start + delta), items.count - 1)
+    }
+
+    /// Shift を押した上下は anchor から lead までの範囲を選ぶ。Shift なしは移動先の1件だけにする。
+    static func move<ID: Hashable>(
+        _ cursor: SelectionCursor<ID>,
+        in items: [ID],
+        delta: Int,
+        extending: Bool
+    ) -> SelectionCursor<ID> {
+        guard !items.isEmpty, delta != 0 else { return cursor }
+        let origin = cursor.lead ?? sole(cursor.selection, in: items)
+        let start: Int
+        if let origin, let found = items.firstIndex(of: origin) {
+            start = found
+        } else if extending, let anchor = cursor.anchor, let found = items.firstIndex(of: anchor) {
+            start = found
+        } else if let edge = edge(cursor.selection, in: items, delta: delta) {
+            start = edge
+        } else {
+            start = delta > 0 ? -1 : items.count
+        }
+        let nextIndex = min(max(0, start + delta), items.count - 1)
+        let next = items[nextIndex]
+        guard extending else {
+            return SelectionCursor(selection: [next], anchor: next, lead: next)
+        }
+        let anchor = cursor.anchor ?? origin ?? next
+        guard let anchorIndex = items.firstIndex(of: anchor) else {
+            return SelectionCursor(selection: [next], anchor: next, lead: next)
+        }
+        let lower = min(anchorIndex, nextIndex)
+        let upper = max(anchorIndex, nextIndex)
+        return SelectionCursor(selection: Set(items[lower...upper]), anchor: anchor, lead: next)
+    }
+
+    private static func sole<ID: Hashable>(_ selection: Set<ID>, in items: [ID]) -> ID? {
+        guard selection.count == 1, let only = selection.first, items.contains(only) else { return nil }
+        return only
+    }
+
+    private static func edge<ID: Hashable>(_ selection: Set<ID>, in items: [ID], delta: Int) -> Int? {
+        let indexes = selection.compactMap { items.firstIndex(of: $0) }
+        guard !indexes.isEmpty else { return nil }
+        return delta > 0 ? indexes.max() : indexes.min()
     }
 }
 
@@ -66,7 +117,8 @@ extension View {
     }
 
     /// この一覧にフォーカスがあるあいだ、上下キーで選択を動かす。
-    func selectionArrows(target: KeyboardTarget, move: @escaping (Int) -> Void) -> some View {
+    /// extending は Shift が押されているとき true。
+    func selectionArrows(target: KeyboardTarget, move: @escaping (_ delta: Int, _ extending: Bool) -> Void) -> some View {
         modifier(SelectionArrowModifier(target: target, move: move))
     }
 
@@ -118,22 +170,28 @@ private struct KeyboardTargetModifier: ViewModifier {
 
 private struct SelectionArrowModifier: ViewModifier {
     var target: KeyboardTarget
-    var move: (Int) -> Void
+    var move: (Int, Bool) -> Void
     @Environment(\.keyboardFocus) private var keyboardFocus
 
     func body(content: Content) -> some View {
         content
-            .onKeyPress(keys: [.upArrow], phases: [.down, .repeat]) { _ in
-                step(-1)
-            }
-            .onKeyPress(keys: [.downArrow], phases: [.down, .repeat]) { _ in
-                step(1)
+            .onKeyPress(phases: [.down, .repeat]) { press in
+                let delta: Int
+                switch press.key {
+                case .upArrow: delta = -1
+                case .downArrow: delta = 1
+                default: return .ignored
+                }
+                // 修飾キー付きの上下は、Shift で範囲を伸ばすときだけ受け取る
+                let modifiers = press.modifiers.subtracting(.capsLock)
+                guard modifiers.isEmpty || modifiers == .shift else { return .ignored }
+                return step(delta, extending: modifiers.contains(.shift))
             }
     }
 
-    private func step(_ delta: Int) -> KeyPress.Result {
+    private func step(_ delta: Int, extending: Bool) -> KeyPress.Result {
         guard keyboardFocus?.target == target else { return .ignored }
-        move(delta)
+        move(delta, extending)
         return .handled
     }
 }

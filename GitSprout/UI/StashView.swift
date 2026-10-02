@@ -62,7 +62,7 @@ struct StashView: View {
                             .listRowBackground(session.selectedStash == stash.ref ? Color.accentColor.opacity(0.18) : Color.clear)
                         }
                         .keyboardTarget(.stashes)
-                        .selectionArrows(target: .stashes) { delta in
+                        .selectionArrows(target: .stashes) { delta, _ in
                             moveStash(delta, proxy: proxy)
                         }
                     }

@@ -47,10 +47,11 @@ actor GitClient {
         return HeadState(name: name, oid: hash, detached: false, unborn: false)
     }
 
-    func status() async throws -> StatusSnapshot {
+    func status(listEachUntrackedFile: Bool = true) async throws -> StatusSnapshot {
+        let untracked = listEachUntrackedFile ? "all" : "normal"
         let output = try await capture(
             key: "status",
-            args: ["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
+            args: ["status", "--porcelain=v2", "-z", "--untracked-files=\(untracked)"],
             limit: GitLimits.listByteLimit,
             preempt: true
         )
@@ -172,7 +173,27 @@ actor GitClient {
         }
     }
 
+    /// ファイル末尾に改行を足す。ステージ済みの差分なら、インデックスの blob も同じように直す。
+    func appendTrailingNewline(path: String, staged: Bool) async throws {
+        let failure = String(localized: "Couldn't add a newline at the end of the file.")
+        guard !path.contains("\n"), !path.contains("\t") else {
+            throw GitFailure(message: failure)
+        }
+        try await withWrite {
+            switch try self.worktreeNewlineTarget(path, failure: failure) {
+            case .file(let url):
+                try self.appendNewline(to: url, failure: failure)
+            case .absent:
+                if !staged { throw GitFailure(message: failure) }
+            }
+            if staged {
+                try await self.appendNewlineToIndex(path, failure: failure)
+            }
+        }
+    }
+
     func commit(message: String, amend: Bool = false) async throws {
+        let message = CommitMessageText.insertingBlankSecondLine(message)
         try await withWrite {
             var args = ["commit"]
             if amend {
@@ -269,18 +290,99 @@ actor GitClient {
     func branches() async throws -> [Branch] {
         let output = try await capture(
             key: "branches",
-            args: ["for-each-ref", "refs/heads", "--format=%(refname:short)\t%(objectname)\t%(HEAD)\t%(upstream:short)\t%(upstream:remotename)"],
+            args: ["for-each-ref", "refs/heads", "--format=%(refname:short)\t%(objectname)\t%(HEAD)\t%(upstream:short)\t%(upstream:remotename)\t%(upstream:track)\t%(committerdate:unix)\t%(subject)"],
             limit: GitLimits.listByteLimit,
             preempt: true
         )
         try requireOK(output, fallback: String(localized: "Couldn't read the branches."))
-        return await Self.parse(output.stdout) { GitBranchParser.parse($0) }
+        let parsed = await Self.parse(output.stdout) { GitBranchParser.parse($0) }
+        let listed = try await capture(
+            key: "remote-heads",
+            args: ["for-each-ref", "refs/remotes", "--format=%(refname:short)\t%(objectname)\t%(committerdate:unix)\t%(subject)"],
+            limit: GitLimits.listByteLimit,
+            preempt: true
+        )
+        try requireOK(listed, fallback: String(localized: "Couldn't read the branches."))
+        let heads = await Self.parse(listed.stdout) { GitRemoteHeadParser.parse($0) }
+        return try await mergingRemoteHeads(parsed, heads: heads)
+    }
+
+    /// 同名のリモートブランチがなければ未公開、ローカルがなければリモート専用の行を足す。
+    private func mergingRemoteHeads(_ branches: [Branch], heads: [RemoteHead]) async throws -> [Branch] {
+        var merged: [Branch] = []
+        merged.reserveCapacity(branches.count + heads.count)
+        for var branch in branches {
+            if branch.sync == .unknown {
+                if let head = GitRemoteHeadParser.match(name: branch.name, heads: heads) {
+                    let upstream = "\(head.remote)/\(head.name)"
+                    if branch.upstream == nil {
+                        branch.upstream = upstream
+                        branch.remoteName = head.remote
+                    }
+                    if branch.oid == head.oid {
+                        branch.sync = .upToDate
+                    } else if let upstream = branch.upstream, let sync = try? await aheadBehindSync(branch: branch.name, upstream: upstream) {
+                        branch.sync = sync
+                    }
+                } else if branch.upstream == nil {
+                    branch.sync = .notOnRemote
+                }
+            }
+            merged.append(branch)
+        }
+        let localNames = Set(branches.map(\.name))
+        var remoteNames = Set<String>()
+        for head in heads where remoteNames.insert(head.name).inserted {
+            guard !localNames.contains(head.name),
+                  let chosen = GitRemoteHeadParser.match(name: head.name, heads: heads) else { continue }
+            merged.append(Branch(
+                name: chosen.name,
+                oid: chosen.oid,
+                isCurrent: false,
+                upstream: "\(chosen.remote)/\(chosen.name)",
+                remoteName: chosen.remote,
+                sync: .remoteOnly,
+                subject: chosen.subject,
+                committedAt: chosen.committedAt
+            ))
+        }
+        merged.sort { $0.name < $1.name }
+        return merged
+    }
+
+    private func aheadBehindSync(branch: String, upstream: String) async throws -> BranchSync {
+        let output = try await capture(
+            key: "branch-sync",
+            args: ["rev-list", "--left-right", "--count", "\(branch)...\(upstream)"],
+            limit: 256,
+            preempt: true
+        )
+        try requireOK(output, fallback: String(localized: "Couldn't compare with the remote branch."))
+        let fields = String(decoding: output.stdout, as: UTF8.self).split(whereSeparator: \.isWhitespace)
+        guard fields.count == 2, let ahead = Int(fields[0]), let behind = Int(fields[1]) else {
+            throw GitFailure(message: String(localized: "Couldn't compare with the remote branch."))
+        }
+        if ahead > 0, behind > 0 { return .diverged(ahead: ahead, behind: behind) }
+        if ahead > 0 { return .ahead(ahead) }
+        if behind > 0 { return .behind(behind) }
+        return .upToDate
     }
 
     func switchBranch(_ name: String) async throws {
         try await withWrite {
             let output = try await self.capture(key: "switch", args: ["switch", "--", name], limit: 65_536, preempt: false)
             try self.requireOK(output, fallback: String(localized: "Couldn't switch branches."))
+        }
+    }
+
+    /// リモートにしかないブランチを、追跡つきのローカルブランチとして作る。
+    func trackRemoteBranch(_ name: String, upstream: String, checkout: Bool) async throws {
+        try await withWrite {
+            let args = checkout
+                ? ["switch", "-c", name, "--track", upstream]
+                : ["branch", "--track", name, upstream]
+            let output = try await self.capture(key: "track-remote", args: args, limit: 65_536, preempt: false)
+            try self.requireOK(output, fallback: String(localized: "Couldn't pull."))
         }
     }
 
@@ -293,6 +395,22 @@ actor GitClient {
                 preempt: false
             )
             try self.requireOK(output, fallback: String(localized: "Couldn't delete the branch."))
+        }
+    }
+
+    func createBranch(_ name: String, from startPoint: String) async throws {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains(where: \.isNewline) else {
+            throw GitFailure(message: String(localized: "Enter a branch name."))
+        }
+        try await withWrite {
+            let output = try await self.capture(
+                key: "branch-create",
+                args: ["branch", "--", trimmed, startPoint],
+                limit: 65_536,
+                preempt: false
+            )
+            try self.requireOK(output, fallback: String(localized: "Couldn't create the branch."))
         }
     }
 
@@ -312,6 +430,23 @@ actor GitClient {
         }
     }
 
+    /// 現在のブランチに `source` をマージする。HEAD が `target` でないときは失敗する。
+    func merge(_ source: String, into target: String) async throws {
+        try await withWrite {
+            let current = try await self.head()
+            guard current.name == target, !current.detached, !current.unborn else {
+                throw GitFailure(message: String(localized: "Couldn't merge."))
+            }
+            let output = try await self.capture(
+                key: "merge",
+                args: ["merge", "--no-edit", "--", source],
+                limit: 262_144,
+                preempt: false
+            )
+            try self.requireOK(output, fallback: String(localized: "Couldn't merge."))
+        }
+    }
+
     /// 上流を取得してから、そのブランチを上流の上にリベースする。
     func rebase(branch: String, onto upstream: String, remote: String?) async throws {
         try await withWrite {
@@ -325,6 +460,41 @@ actor GitClient {
                 preempt: false
             )
             try self.requireOK(output, fallback: String(localized: "Couldn't rebase the branch."))
+        }
+    }
+
+    /// 上流を取得してから、そのブランチとの差を返す。分かれているときは早送りできない。
+    func pullDivergence(branch: String, upstream: String, remote: String) async throws -> PushDivergence {
+        try await withWrite {
+            try await self.fetch(remote)
+        }
+        return try await pushDivergence(branch: branch, upstream: upstream)
+    }
+
+    /// ローカルが遅れているときだけ早送りする。分岐しているときは失敗する。
+    /// `fetches` が false のときは、直前に取得済みの上流を使う。
+    func fastForward(branch: String, upstream: String, remote: String, isCurrent: Bool, fetches: Bool = true) async throws {
+        try await withWrite {
+            if fetches {
+                try await self.fetch(remote)
+            }
+            if isCurrent {
+                let output = try await self.capture(
+                    key: "ff-merge",
+                    args: ["merge", "--ff-only", upstream],
+                    limit: 65_536,
+                    preempt: false
+                )
+                try self.requireOK(output, fallback: String(localized: "Couldn't pull."))
+            } else {
+                let output = try await self.capture(
+                    key: "ff-branch",
+                    args: ["push", ".", "\(upstream):\(branch)"],
+                    limit: 65_536,
+                    preempt: false
+                )
+                try self.requireOK(output, fallback: String(localized: "Couldn't pull."))
+            }
         }
     }
 
@@ -426,6 +596,19 @@ actor GitClient {
         try requireOK(output, fallback: String(localized: "Couldn't fetch from the remote."))
     }
 
+    /// HEAD を親へ戻す。インデックスと作業ツリーは触らないので、取り消した内容はステージされたまま残る。
+    func undoHeadCommit() async throws {
+        try await withWrite {
+            let output = try await self.capture(
+                key: "undo-commit",
+                args: ["reset", "--soft", "HEAD^"],
+                limit: 65_536,
+                preempt: false
+            )
+            try self.requireOK(output, fallback: String(localized: "Couldn't undo the commit."))
+        }
+    }
+
     func detach(oid: String) async throws {
         try await withWrite {
             let output = try await self.capture(
@@ -449,7 +632,17 @@ actor GitClient {
         return await Self.parse(output.stdout) { GitStashParser.parse($0) }
     }
 
-    func stashPush(message: String?, includeUntracked: Bool = false) async throws {
+    func stashPush(message: String?, includeUntracked: Bool = false, unstagedOnly: Bool = false) async throws {
+        try await withWrite {
+            if unstagedOnly {
+                try await self.stashUnstagedUnlocked(message: message, includeUntracked: includeUntracked)
+            } else {
+                try await self.pushStashUnlocked(message: message, includeUntracked: includeUntracked)
+            }
+        }
+    }
+
+    private func pushStashUnlocked(message: String?, includeUntracked: Bool) async throws {
         var args = ["stash", "push"]
         if includeUntracked {
             args.append("-u")
@@ -457,10 +650,133 @@ actor GitClient {
         if let message, !message.isEmpty {
             args.append(contentsOf: ["-m", message])
         }
-        try await withWrite {
-            let output = try await self.capture(key: "stash-write", args: args, limit: 65_536, preempt: false)
-            try self.requireOK(output, fallback: String(localized: "Couldn't create the stash."))
+        let output = try await capture(key: "stash-write", args: args, limit: 65_536, preempt: false)
+        try requireOK(output, fallback: String(localized: "Couldn't create the stash."))
+    }
+
+    /// ステージ済みはインデックスに残し、未ステージの変更だけをスタッシュする。
+    /// 通常のスタッシュは先頭の親が HEAD なので、適用するとステージ済みの差分まで戻そうとする。
+    /// 先頭の親を今のインデックスにすると、戻るのは作業ツリーとの差分だけになる。
+    private func stashUnstagedUnlocked(message: String?, includeUntracked: Bool) async throws {
+        let fallback = String(localized: "Couldn't create the stash.")
+        let cached = try await capture(
+            key: "stash-write",
+            args: ["diff", "--cached", "--quiet"],
+            limit: 1024,
+            preempt: false
+        )
+        if cached.status > 1 {
+            try requireOK(cached, fallback: fallback)
         }
+        if cached.status == 0 {
+            try await pushStashUnlocked(message: message, includeUntracked: includeUntracked)
+            return
+        }
+
+        let head = try await stashText(["rev-parse", "--verify", "HEAD"], fallback: fallback)
+        let branch = try await stashText(["branch", "--show-current"], limit: 1024, fallback: fallback)
+        let branchLabel = branch.isEmpty ? "(no branch)" : branch
+        let indexTree = try await stashText(["write-tree"], fallback: fallback)
+        let workTree = try await stagedWorktree(indexTree: indexTree, fallback: fallback)
+        let untracked = try await untrackedCommit(include: includeUntracked, fallback: fallback)
+        guard workTree != indexTree || untracked != nil else {
+            throw GitFailure(message: String(localized: "No local changes to save"))
+        }
+
+        let label: String
+        if let message, !message.isEmpty {
+            label = "On \(branchLabel): \(message)"
+        } else {
+            let short = try await stashText(["rev-parse", "--short", "HEAD"], fallback: fallback)
+            let subject = try await stashText(["log", "-1", "--format=%s"], fallback: fallback)
+            label = "WIP on \(branchLabel): \(short) \(subject)"
+        }
+        let base = try await stashText(["commit-tree", indexTree, "-p", head, "-m", label], fallback: fallback)
+        let indexCommit = try await stashText(
+            ["commit-tree", indexTree, "-p", base, "-m", "index on \(branchLabel)"],
+            fallback: fallback
+        )
+        var parents = ["commit-tree", workTree, "-p", base, "-p", indexCommit]
+        if let untracked {
+            parents.append(contentsOf: ["-p", untracked])
+        }
+        parents.append(contentsOf: ["-m", label])
+        let stash = try await stashText(parents, fallback: fallback)
+        _ = try await stashText(["stash", "store", "-m", label, stash], fallback: fallback)
+        _ = try await stashText(["restore", "--worktree", "--", "."], fallback: fallback)
+        if untracked != nil {
+            let cleaned = try await capture(key: "stash-write", args: ["clean", "-fdq"], limit: 1024, preempt: false)
+            try requireOK(cleaned, fallback: fallback)
+        }
+    }
+
+    /// 本物のインデックスは変えず、作業ツリーの追跡済み内容だけを木にする。
+    private func stagedWorktree(indexTree: String, fallback: String) async throws -> String {
+        let index = try temporaryIndexFile(fallback: fallback)
+        defer { try? FileManager.default.removeItem(at: index) }
+        let environment = ["GIT_INDEX_FILE": index.path]
+        _ = try await stashText(["read-tree", indexTree], environment: environment, fallback: fallback)
+        _ = try await stashText(["add", "-u"], environment: environment, fallback: fallback)
+        return try await stashText(["write-tree"], environment: environment, fallback: fallback)
+    }
+
+    /// 未追跡ファイルだけのコミット。スタッシュの3番目の親にする。
+    private func untrackedCommit(include: Bool, fallback: String) async throws -> String? {
+        guard include else { return nil }
+        let listed = try await capture(
+            key: "stash-write",
+            args: ["ls-files", "-o", "--exclude-standard", "-z"],
+            limit: GitLimits.listByteLimit,
+            preempt: false
+        )
+        if listed.truncated {
+            throw GitFailure(message: fallback)
+        }
+        try requireOK(listed, fallback: fallback)
+        guard !listed.stdout.isEmpty else { return nil }
+        let index = try temporaryIndexFile(fallback: fallback)
+        defer { try? FileManager.default.removeItem(at: index) }
+        let environment = ["GIT_INDEX_FILE": index.path]
+        _ = try await stashText(["read-tree", "--empty"], environment: environment, fallback: fallback)
+        _ = try await stashText(
+            ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+            input: listed.stdout,
+            environment: environment,
+            fallback: fallback
+        )
+        let tree = try await stashText(["write-tree"], environment: environment, fallback: fallback)
+        return try await stashText(["commit-tree", tree, "-m", "untracked files"], fallback: fallback)
+    }
+
+    private func temporaryIndexFile(fallback: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gitsprout-index-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: url.path, contents: Data()) else {
+            throw GitFailure(message: fallback)
+        }
+        return url
+    }
+
+    private func stashText(
+        _ args: [String],
+        input: Data? = nil,
+        limit: Int = 65_536,
+        environment: [String: String] = [:],
+        fallback: String
+    ) async throws -> String {
+        let output = try await capture(
+            key: "stash-write",
+            args: args,
+            input: input,
+            limit: limit,
+            preempt: false,
+            environment: environment
+        )
+        if output.truncated {
+            throw GitFailure(message: fallback)
+        }
+        try requireOK(output, fallback: fallback)
+        return String(decoding: output.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// 渡したパスのうち、gitignore に当てはまるものだけを返す。追跡済みファイルは含めない。
@@ -624,9 +940,70 @@ actor GitClient {
             preempt: true
         )
         try requireOK(output, fallback: String(localized: "Couldn't search commits."))
-        let commits = await Self.parse(output.stdout) { GitLogParser.parse($0) }
-        let capped = commits.count > GitLimits.searchLimit
-        return CappedList(values: Array(commits.prefix(GitLimits.searchLimit)), capped: capped)
+        let messages = await Self.parse(output.stdout) { GitLogParser.parse($0) }
+        let messageCapped = messages.count > GitLimits.searchLimit
+        let byID = try await commitsMatchingID(query)
+        var seen: Set<String> = []
+        var merged: [CommitRecord] = []
+        for commit in byID + messages {
+            if seen.insert(commit.oid).inserted {
+                merged.append(commit)
+            }
+        }
+        let capped = messageCapped || merged.count > GitLimits.searchLimit
+        return CappedList(values: Array(merged.prefix(GitLimits.searchLimit)), capped: capped)
+    }
+
+    /// `--grep` はメッセージだけを見る。7文字以上の16進はコミットIDとしても解決する
+    private func commitsMatchingID(_ query: String) async throws -> [CommitRecord] {
+        guard Self.isCommitIDPrefix(query) else { return [] }
+        let listed = try await capture(
+            key: "search",
+            args: ["rev-parse", "--disambiguate=\(query.lowercased())"],
+            limit: 1_000_000,
+            preempt: true
+        )
+        if listed.status != 0 { return [] }
+        let names = String(decoding: listed.stdout, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter(Self.isCommitIDPrefix)
+        guard !names.isEmpty else { return [] }
+        let checked = try await capture(
+            key: "search",
+            args: ["cat-file", "--batch-check"],
+            input: Data((names.prefix(2_000).joined(separator: "\n") + "\n").utf8),
+            limit: 1_000_000,
+            preempt: true
+        )
+        if checked.status != 0 { return [] }
+        let oids = String(decoding: checked.stdout, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { line -> String? in
+                let parts = line.split(separator: " ")
+                guard parts.count >= 2, parts[1] == "commit" else { return nil }
+                return String(parts[0])
+            }
+        let commits = Array(oids.prefix(GitLimits.searchLimit + 1))
+        guard !commits.isEmpty else { return [] }
+        let output = try await capture(
+            key: "search",
+            args: [
+                "log", "--no-walk", "--date-order",
+                "--pretty=format:\(Self.logFormat)", "--decorate=full"
+            ] + commits,
+            limit: GitLimits.listByteLimit,
+            preempt: true
+        )
+        try requireOK(output, fallback: String(localized: "Couldn't search commits."))
+        return await Self.parse(output.stdout) { GitLogParser.parse($0) }
+    }
+
+    private static func isCommitIDPrefix(_ query: String) -> Bool {
+        guard (7...64).contains(query.count) else { return false }
+        return query.utf8.allSatisfy { byte in
+            (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
+        }
     }
 
     func searchPaths(query: String) async throws -> CappedList<String> {
@@ -652,7 +1029,7 @@ actor GitClient {
         return CappedList(values: scan.snapshot(), capped: scan.hitLimit)
     }
 
-    private static let logFormat = "%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%d%x1f%s%x1e"
+    private static let logFormat = "%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%d%x1f%s%x1f%b%x1e"
 
     /// 未追跡ファイルは `git diff` が空になる。インデックスに無いときだけ `/dev/null` との差分を作る。
     private func untrackedWorktreeDiff(path: String, ignoringWhitespace: Bool) async throws -> DiffDocument? {
@@ -688,7 +1065,7 @@ actor GitClient {
         let oldName = originalPath ?? document.renameFrom
         guard ImagePaths.isImage(path) || ImagePaths.isImage(oldName ?? "") else { return document }
         if document.isEmpty, !staged {
-            // 未追跡の画像は git diff が空になる。インデックスに無く、作業ツリーにあるときだけ絵を出す。
+            // 未追跡の画像は git diff が空になるので、インデックスに無く作業ツリーにあるときだけ絵を出す
             let indexed = try await objectImage(rev: "", path: path)
             guard indexed == .absent else { return document }
             let after = worktreeImage(path)
@@ -793,6 +1170,110 @@ actor GitClient {
         return .data(output.stdout)
     }
 
+    private enum WorktreeNewlineTarget {
+        case file(URL)
+        case absent
+    }
+
+    private func worktreeNewlineTarget(_ path: String, failure: String) throws -> WorktreeNewlineTarget {
+        let root = URL(fileURLWithPath: workingDirectory, isDirectory: true).standardizedFileURL
+        let url = root.appending(path: path)
+        let resolved = url.standardizedFileURL
+        guard resolved.path == root.path || resolved.path.hasPrefix(root.path + "/") else {
+            throw GitFailure(message: failure)
+        }
+        let values: URLResourceValues
+        do {
+            values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+        } catch {
+            return .absent
+        }
+        if values.isSymbolicLink == true {
+            throw GitFailure(message: failure)
+        }
+        guard values.isRegularFile == true else { return .absent }
+        return .file(url)
+    }
+
+    private func appendNewline(to url: URL, failure: String) throws {
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forUpdating: url)
+        } catch {
+            throw GitFailure(message: failure)
+        }
+        defer { try? handle.close() }
+        do {
+            let end = try handle.seekToEnd()
+            if end > 0 {
+                try handle.seek(toOffset: end - 1)
+                if try handle.read(upToCount: 1) == Data([0x0A]) { return }
+                try handle.seek(toOffset: end)
+            }
+            try handle.write(contentsOf: Data([0x0A]))
+        } catch {
+            throw GitFailure(message: failure)
+        }
+    }
+
+    private func appendNewlineToIndex(_ path: String, failure: String) async throws {
+        let listed = try await capture(
+            key: "newline",
+            args: ["ls-files", "-s", "-z", "--", path],
+            limit: 65_536,
+            preempt: false
+        )
+        try requireOK(listed, fallback: failure)
+        guard let entry = IndexStageParser.regularBlob(listed.stdout) else {
+            throw GitFailure(message: failure)
+        }
+        let sizeOutput = try await capture(
+            key: "newline",
+            args: ["cat-file", "-s", entry.hash],
+            limit: 64,
+            preempt: false
+        )
+        try requireOK(sizeOutput, fallback: failure)
+        let sizeText = String(decoding: sizeOutput.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let size = Int(sizeText), size >= 0, size <= GitLimits.imageByteLimit else {
+            throw GitFailure(message: failure)
+        }
+        let blob = try await capture(
+            key: "newline",
+            args: ["cat-file", "blob", entry.hash],
+            limit: size + 1,
+            preempt: false
+        )
+        try requireOK(blob, fallback: failure)
+        guard !blob.truncated, blob.stdout.count == size else {
+            throw GitFailure(message: failure)
+        }
+        if blob.stdout.last == 0x0A { return }
+        var data = blob.stdout
+        data.append(0x0A)
+        let hashed = try await capture(
+            key: "newline",
+            args: ["hash-object", "-w", "--stdin"],
+            input: data,
+            limit: 128,
+            preempt: false
+        )
+        try requireOK(hashed, fallback: failure)
+        let hash = String(decoding: hashed.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !hash.isEmpty else { throw GitFailure(message: failure) }
+        let info = Data("\(entry.mode) \(hash) 0\t\(path)\n".utf8)
+        let updated = try await capture(
+            key: "newline",
+            args: ["update-index", "--index-info"],
+            input: info,
+            limit: 4_096,
+            preempt: false
+        )
+        try requireOK(updated, fallback: failure)
+    }
+
     private func worktreeImage(_ path: String) -> ImagePayload {
         let root = URL(fileURLWithPath: workingDirectory, isDirectory: true).standardizedFileURL
         let url = root.appending(path: path).standardizedFileURL
@@ -860,7 +1341,8 @@ actor GitClient {
         input: Data? = nil,
         limit: Int?,
         preempt: Bool,
-        scan: GitStdoutScan? = nil
+        scan: GitStdoutScan? = nil,
+        environment: [String: String] = [:]
     ) async throws -> GitOutput {
         let box = GitProcessBox()
         if preempt {
@@ -870,7 +1352,14 @@ actor GitClient {
         }
         do {
             let output = try await box.run(
-                Self.makeRequest(repo: workingDirectory, args: args, input: input, limit: limit, scan: scan),
+                Self.makeRequest(
+                    repo: workingDirectory,
+                    args: args,
+                    input: input,
+                    limit: limit,
+                    scan: scan,
+                    environment: environment
+                ),
                 cancelOnTaskCancel: preempt
             )
             if preempt, inflight[key] === box {
@@ -909,20 +1398,24 @@ actor GitClient {
         args: [String],
         input: Data? = nil,
         limit: Int? = nil,
-        scan: GitStdoutScan? = nil
+        scan: GitStdoutScan? = nil,
+        environment: [String: String] = [:]
     ) -> GitRequest {
         var full = ["-c", "diff.renames=true", "-c", "core.quotepath=false"]
         if let repo {
             full.insert(contentsOf: ["-C", repo], at: 0)
         }
         full.append(contentsOf: args)
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_OPTIONAL_LOCKS"] = "0"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        environment["GIT_PAGER"] = "cat"
+        var processEnvironment = ProcessInfo.processInfo.environment
+        processEnvironment["GIT_OPTIONAL_LOCKS"] = "0"
+        processEnvironment["GIT_TERMINAL_PROMPT"] = "0"
+        processEnvironment["GIT_PAGER"] = "cat"
+        for (key, value) in environment {
+            processEnvironment[key] = value
+        }
         return GitRequest(
             arguments: full,
-            environment: environment,
+            environment: processEnvironment,
             workingDirectory: repo,
             standardInput: input,
             stdoutByteLimit: limit,

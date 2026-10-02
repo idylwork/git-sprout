@@ -3,6 +3,7 @@
 //  GitSprout
 //
 
+import AppKit
 import Combine
 import SwiftUI
 
@@ -12,11 +13,17 @@ struct WorkspaceView: View {
     @AppStorage(AppSettings.showTerminalButtonKey) private var showTerminalButton = true
     @AppStorage(AppSettings.terminalFontSizeKey) private var terminalFontSize = 13.0
     @AppStorage(AppSettings.ignoreWhitespaceKey) private var ignoreWhitespace = false
+    @AppStorage(AppSettings.listEachUntrackedFileKey) private var listEachUntrackedFile = true
+    @AppStorage(AppSettings.branchOrderKey) private var branchOrder = BranchOrder.lastCommit.rawValue
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openURL) private var openURL
     @State private var renamingBranch: String?
+    @State private var creatingBranchFrom: String?
+    @State private var showingRemoteBranchSheet = false
     @State private var renameOriginal = ""
     @State private var renameDraft = ""
+    @State private var createBranchSource = ""
+    @State private var createBranchDraft = ""
     @State private var terminalFocus = 0
     @State private var sidebarWidth: CGFloat = 210
     @State private var historyHeight: CGFloat = 210
@@ -39,23 +46,9 @@ struct WorkspaceView: View {
         .navigationTitle(session.displayName)
         .toolbar(removing: .title)
         .toolbar {
-            ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
-                    RecentRepositoryMenu(
-                        model: model,
-                        currentPath: session.rootPath,
-                        title: session.displayName
-                    )
-                    Text(session.head.title)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-            }
+            repositoryTitle
             if session.isLoading || session.isMutating {
-                ToolbarItem {
-                    ProgressView()
-                        .controlSize(.small)
-                }
+                loadingIndicator
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -82,6 +75,9 @@ struct WorkspaceView: View {
         }
         .onChange(of: ignoreWhitespace) { _, _ in
             Task { await session.reloadOpenDiffs() }
+        }
+        .onChange(of: listEachUntrackedFile) { _, _ in
+            Task { await session.refreshStatus() }
         }
         .task(id: session.rootPath) {
             await session.initialLoad()
@@ -151,6 +147,27 @@ struct WorkspaceView: View {
         ) {
             FileHistorySheet(session: session)
         }
+        .sheet(isPresented: $showingRemoteBranchSheet) {
+            RemoteBranchesSheet(session: session)
+        }
+        .alert(
+            "New Branch",
+            isPresented: Binding(
+                get: { creatingBranchFrom != nil },
+                set: { if !$0 { creatingBranchFrom = nil } }
+            )
+        ) {
+            TextField("Branch Name", text: $createBranchDraft)
+            Button("Create") {
+                let source = createBranchSource
+                let draft = createBranchDraft
+                Task { await session.createBranch(from: source, named: draft) }
+            }
+            .disabled(createBranchDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Create a new branch from \(createBranchSource).")
+        }
         .alert(
             "Rename Branch",
             isPresented: Binding(
@@ -168,6 +185,60 @@ struct WorkspaceView: View {
         } message: {
             Text("Choose a new name for \(renameOriginal).")
         }
+    }
+
+    /// ボタン用のガラス背景だと、スピナーが左に寄って見える。
+    @ToolbarContentBuilder
+    private var loadingIndicator: some ToolbarContent {
+        if #available(macOS 26, *) {
+            ToolbarItem(placement: .primaryAction) {
+                loadingIndicatorLabel
+            }
+            .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .primaryAction) {
+                loadingIndicatorLabel
+            }
+        }
+    }
+
+    private var loadingIndicatorLabel: some View {
+        ProgressView()
+            .controlSize(.small)
+            .padding(.leading, 8)
+            .padding(.trailing, 4)
+    }
+
+    /// ガラスのタイトルバーはボタン用の余白が付く。リポジトリ名はタイトルとして置き、上下を詰める。
+    @ToolbarContentBuilder
+    private var repositoryTitle: some ToolbarContent {
+        if #available(macOS 26, *) {
+            ToolbarItem(placement: .principal) {
+                repositoryTitleLabel
+            }
+            .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .principal) {
+                repositoryTitleLabel
+            }
+        }
+    }
+
+    private var repositoryTitleLabel: some View {
+        VStack(spacing: 0) {
+            RecentRepositoryMenu(
+                model: model,
+                currentPath: session.rootPath,
+                title: session.displayName
+            )
+            Text(session.head.title)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.top, 1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 2)
     }
 
     private var sidebarColumn: some View {
@@ -240,12 +311,15 @@ struct WorkspaceView: View {
                 if session.branchesLoading && session.branches.isEmpty {
                     Text("Loading…")
                         .foregroundStyle(.secondary)
-                } else if session.branches.isEmpty {
+                } else if localBranches.isEmpty && remoteBranches.isEmpty {
                     Text("None")
                         .foregroundStyle(.secondary)
                 }
-                ForEach(session.branches) { branch in
+                ForEach(localBranches) { branch in
                     branchRow(branch)
+                }
+                if !remoteBranches.isEmpty {
+                    showMoreBranchesRow
                 }
             } header: {
                 Label("Branches", systemImage: "arrow.triangle.branch")
@@ -255,66 +329,195 @@ struct WorkspaceView: View {
         .keyboardTarget(.sidebar)
     }
 
-    private func branchRow(_ branch: Branch) -> some View {
-        HStack {
-            Text(branch.name)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-            if branch.isCurrent {
-                Image(systemName: "checkmark")
-                    .foregroundStyle(.secondary)
+    /// 選択中マークとブランチ名を、サイドバーの既定位置より少し右に置く。
+    private let branchMarkLeading: CGFloat = 10
+    private let branchMarkWidth: CGFloat = 16
+
+    private var localBranches: [Branch] {
+        let order = BranchOrder(rawValue: branchOrder) ?? .lastCommit
+        return order.sorted(session.branches.filter { $0.sync != .remoteOnly })
+    }
+
+    private var remoteBranches: [Branch] {
+        session.branches.filter { $0.sync == .remoteOnly }
+    }
+
+    private var showMoreBranchesRow: some View {
+        Text("Show More")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, branchMarkLeading + branchMarkWidth + 6)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                showingRemoteBranchSheet = true
             }
+    }
+
+    private func branchRow(_ branch: Branch) -> some View {
+        HStack(spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrowtriangle.right.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .opacity(branch.isCurrent ? 1 : 0)
+                    .accessibilityHidden(!branch.isCurrent)
+                    .frame(width: branchMarkWidth, alignment: .center)
+                    .layoutPriority(1)
+                Text(branch.name)
+                    .lineLimit(1)
+                    .foregroundStyle(branch.sync == .remoteOnly ? .secondary : .primary)
+                Spacer(minLength: 8)
+            }
+            .padding(.leading, branchMarkLeading)
+            .contentShape(Rectangle())
+            .gesture(TapGesture(count: 2).onEnded { checkout(branch) })
+            .simultaneousGesture(TapGesture(count: 1).onEnded { focus(branch) })
+            syncMark(branch)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .gesture(TapGesture(count: 2).onEnded { checkout(branch) })
-        .simultaneousGesture(TapGesture(count: 1).onEnded { focus(branch) })
         .contextMenu {
             Button("Checkout") {
                 checkout(branch)
             }
             .disabled(branch.isCurrent || session.isMutating)
+            Button("Copy Branch Name") {
+                copyBranchName(branch.name)
+            }
             Divider()
             Button("Pull") {
-                guard let upstream = branch.upstream, let remote = branch.remoteName else { return }
-                session.pendingConfirm = .pull(
-                    name: branch.name,
-                    upstream: upstream,
-                    remote: remote,
-                    isCurrent: branch.isCurrent
-                )
+                Task { await session.pull(branch) }
             }
-            .disabled(branch.upstream == nil || branch.remoteName == nil || session.isMutating)
+            .disabled(branch.sync != .remoteOnly && (branch.upstream == nil || branch.remoteName == nil) || session.isMutating)
             Button("Push") {
                 Task { await session.push(branch) }
             }
-            .disabled(session.isMutating || (session.remoteLink == nil && branch.remoteName == nil))
-            Button("Delete", role: .destructive) {
-                session.pendingConfirm = .deleteBranch(branch.name)
+            .disabled(branch.sync == .remoteOnly || session.isMutating || (session.remoteLink == nil && branch.remoteName == nil))
+            Button("New Branch") {
+                createBranchSource = branch.name
+                createBranchDraft = ""
+                creatingBranchFrom = branch.name
             }
-            .disabled(branch.isCurrent || session.isMutating)
+            .disabled(branch.sync == .remoteOnly || session.isMutating)
             Button("Rename") {
                 renameOriginal = branch.name
                 renameDraft = branch.name
                 renamingBranch = branch.name
             }
-            .disabled(session.isMutating)
-            Button("Rebase") {
-                guard let upstream = branch.upstream else { return }
-                session.pendingConfirm = .rebaseBranch(name: branch.name, upstream: upstream, remote: branch.remoteName)
+            .disabled(branch.sync == .remoteOnly || session.isMutating)
+            Divider()
+            if let target = currentBranchName, mergeSource(branch) != target {
+                let source = mergeSource(branch)
+                Button(String(localized: "Merge \(source) into \(target)")) {
+                    session.pendingConfirm = .mergeBranch(source: source, into: target)
+                }
+                .disabled(session.isMutating)
+            } else {
+                Button("Merge") {}
+                    .disabled(true)
             }
-            .disabled(branch.upstream == nil || session.isMutating)
-            Button("Force Match Remote", role: .destructive) {
-                guard let upstream = branch.upstream, let remote = branch.remoteName else { return }
-                session.pendingConfirm = .matchRemote(
-                    name: branch.name,
-                    upstream: upstream,
-                    remote: remote,
-                    isCurrent: branch.isCurrent
-                )
+            if let current = currentBranchName, mergeSource(branch) != current {
+                let onto = mergeSource(branch)
+                Button(String(localized: "Rebase \(current) on top of \(onto)")) {
+                    session.pendingConfirm = .rebaseBranch(name: current, upstream: onto, remote: nil)
+                }
+                .disabled(session.isMutating)
+            } else {
+                Button("Rebase") {}
+                    .disabled(true)
             }
-            .disabled(branch.upstream == nil || branch.remoteName == nil || session.isMutating)
+            Button("Delete", role: .destructive) {
+                session.pendingConfirm = .deleteBranch(branch.name)
+            }
+            .disabled(branch.isCurrent || branch.sync == .remoteOnly || session.isMutating)
         }
+    }
+
+    private var currentBranchName: String? {
+        guard !session.head.detached, !session.head.unborn else { return nil }
+        let name = session.head.name
+        guard !name.isEmpty, name != HeadState.unknown.name else { return nil }
+        return name
+    }
+
+    /// ローカルブランチはその名前、リモートにしかないブランチは上流の参照をマージ元にする。
+    private func mergeSource(_ branch: Branch) -> String {
+        if branch.sync == .remoteOnly, let upstream = branch.upstream {
+            return upstream
+        }
+        return branch.name
+    }
+
+    @ViewBuilder
+    private func syncMark(_ branch: Branch) -> some View {
+        switch branch.sync {
+        case .unknown, .upToDate:
+            EmptyView()
+        case .notOnRemote:
+            BranchSyncMenu(
+                systemImage: "arrow.up",
+                help: String(localized: "This branch is not on the remote"),
+                showsPush: true,
+                showsPull: false,
+                isDisabled: session.isMutating,
+                push: { Task { await session.push(branch) } },
+                pull: {}
+            )
+        case .remoteOnly:
+            BranchSyncMenu(
+                systemImage: "arrow.down",
+                help: String(localized: "This branch is not on this computer"),
+                showsPush: false,
+                showsPull: true,
+                isDisabled: session.isMutating,
+                push: {},
+                pull: { Task { await session.pull(branch) } }
+            )
+        case .ahead(let count):
+            BranchSyncMenu(
+                systemImage: "arrow.up",
+                help: aheadHelp(count),
+                showsPush: true,
+                showsPull: false,
+                isDisabled: session.isMutating,
+                push: { Task { await session.push(branch) } },
+                pull: {}
+            )
+        case .behind(let count):
+            BranchSyncMenu(
+                systemImage: "arrow.down",
+                help: behindHelp(count),
+                showsPush: false,
+                showsPull: true,
+                isDisabled: session.isMutating,
+                push: {},
+                pull: { Task { await session.pull(branch) } }
+            )
+        case .diverged:
+            BranchSyncMenu(
+                systemImage: "arrow.up.arrow.down",
+                help: String(localized: "This branch and the upstream have diverged."),
+                showsPush: true,
+                showsPull: true,
+                isDisabled: session.isMutating,
+                push: { Task { await session.push(branch) } },
+                pull: { Task { await session.pull(branch) } }
+            )
+        }
+    }
+
+    private func aheadHelp(_ count: Int) -> String {
+        if count == 1 { return String(localized: "1 commit ahead of the upstream") }
+        return String(localized: "\(count) commits ahead of the upstream")
+    }
+
+    private func behindHelp(_ count: Int) -> String {
+        if count == 1 { return String(localized: "1 commit behind the upstream") }
+        return String(localized: "\(count) commits behind the upstream")
+    }
+
+    private func copyBranchName(_ name: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(name, forType: .string)
     }
 
     private func focus(_ branch: Branch) {
@@ -324,6 +527,10 @@ struct WorkspaceView: View {
 
     private func checkout(_ branch: Branch) {
         guard !branch.isCurrent, !session.isMutating else { return }
+        if branch.sync == .remoteOnly {
+            Task { await session.checkoutRemote(branch) }
+            return
+        }
         Task { await session.switchBranch(branch.name) }
     }
 
@@ -394,6 +601,60 @@ struct WorkspaceView: View {
     }
 }
 
+/// ローカルにないリモートブランチを、ここから取得する。
+private struct RemoteBranchesSheet: View {
+    var session: WorkspaceSession
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(AppSettings.branchOrderKey) private var branchOrder = BranchOrder.lastCommit.rawValue
+
+    private var branches: [Branch] {
+        let order = BranchOrder(rawValue: branchOrder) ?? .lastCommit
+        return order.sorted(session.branches.filter { $0.sync == .remoteOnly })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Remote Branches")
+                .font(.headline)
+            if branches.isEmpty {
+                Text("None")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
+            } else {
+                List(branches) { branch in
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(branch.name)
+                                .lineLimit(1)
+                            if let subject = branch.subjectLine {
+                                Text(subject)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        Spacer(minLength: 8)
+                        Button("Pull") {
+                            Task { await session.pull(branch) }
+                        }
+                        .disabled(session.isMutating)
+                    }
+                }
+                .frame(minHeight: 160, maxHeight: 320)
+            }
+            HStack {
+                Spacer()
+                Button("Done") {
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+}
+
 private struct RecentRepositoryMenu: View {
     var model: AppModel
     var currentPath: String
@@ -422,9 +683,66 @@ private struct RecentRepositoryMenu: View {
         } label: {
             Text(title)
                 .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 2)
         }
         .menuStyle(.borderlessButton)
+        .controlSize(.small)
         .fixedSize()
+        .padding(.vertical, -3)
         .help(currentPath)
+    }
+}
+
+private struct BranchSyncMenu: View {
+    var systemImage: String
+    var help: String
+    var showsPush: Bool
+    var showsPull: Bool
+    var isDisabled: Bool
+    var push: () -> Void
+    var pull: () -> Void
+
+    var body: some View {
+        Group {
+            if showsPush || showsPull {
+                syncMenu
+            } else {
+                Image(systemName: systemImage)
+            }
+        }
+        .foregroundStyle(.primary)
+        .help(help)
+    }
+
+    private var menu: some View {
+        Menu {
+            if showsPush {
+                Button("Push", action: push)
+            }
+            if showsPull {
+                Button("Pull", action: pull)
+            }
+        } label: {
+            Image(systemName: systemImage)
+                .font(.system(size: 10, weight: .semibold))
+        }
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(isDisabled)
+    }
+
+    @ViewBuilder
+    private var syncMenu: some View {
+        if #available(macOS 26, *) {
+            menu
+                .menuStyle(.button)
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .controlSize(.small)
+        } else {
+            menu
+                .menuStyle(.borderlessButton)
+                .tint(.primary)
+        }
     }
 }

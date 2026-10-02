@@ -12,7 +12,9 @@ struct SettingsView: View {
     @AppStorage(AppSettings.terminalFontSizeKey) private var terminalFontSize = 13.0
     @AppStorage(AppSettings.stashIncludeUntrackedKey) private var stashIncludeUntracked = true
     @AppStorage(AppSettings.wrapDiffLinesKey) private var wrapDiffLines = false
+    @AppStorage(AppSettings.listEachUntrackedFileKey) private var listEachUntrackedFile = true
     @AppStorage(AppSettings.commitMessageLanguageKey) private var commitMessageLanguage = AppSettings.defaultCommitMessageLanguage.rawValue
+    @AppStorage(AppSettings.branchOrderKey) private var branchOrder = BranchOrder.lastCommit.rawValue
 
     var body: some View {
         Form {
@@ -23,16 +25,25 @@ struct SettingsView: View {
                         Text(choice.title).tag(choice.rawValue)
                     }
                 }
-            }
-            Section("Commit") {
-                Picker("Suggestion Language", selection: $commitMessageLanguage) {
-                    ForEach(CommitMessageLanguage.allCases) { choice in
+                Toggle("Wrap Lines", isOn: $wrapDiffLines)
+                Picker("Branch Order", selection: $branchOrder) {
+                    ForEach(BranchOrder.allCases) { choice in
                         Text(choice.title).tag(choice.rawValue)
                     }
                 }
             }
-            Section("Diff") {
-                Toggle("Wrap Lines", isOn: $wrapDiffLines)
+            Section("Commit") {
+                if CommitMessageSuggester.isAvailable || DiffReviewer.isAvailable {
+                    Picker("Suggestion Language", selection: $commitMessageLanguage) {
+                        ForEach(CommitMessageLanguage.allCases) { choice in
+                            Text(choice.title).tag(choice.rawValue)
+                        }
+                    }
+                }
+                Toggle("List Each File in Untracked Folders", isOn: $listEachUntrackedFile)
+            }
+            Section("Stash") {
+                Toggle("Include Untracked Files", isOn: $stashIncludeUntracked)
             }
             Section("Terminal") {
                 Toggle("Show Terminal Button", isOn: $showTerminalButton)
@@ -47,9 +58,6 @@ struct SettingsView: View {
                             .lineLimit(1)
                     }
                 }
-            }
-            Section("Stash") {
-                Toggle("Include Untracked Files", isOn: $stashIncludeUntracked)
             }
         }
         .formStyle(.grouped)

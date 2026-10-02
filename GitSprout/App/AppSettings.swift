@@ -13,7 +13,9 @@ enum AppSettings {
     static let reopenLastRepositoryKey = "reopenLastRepository"
     static let ignoreWhitespaceKey = "ignoreWhitespace"
     static let wrapDiffLinesKey = "wrapDiffLines"
+    static let listEachUntrackedFileKey = "listEachUntrackedFile"
     static let commitMessageLanguageKey = "commitMessageLanguage"
+    static let branchOrderKey = "branchOrder"
 
     enum Appearance: String, CaseIterable, Identifiable {
         case system
@@ -53,7 +55,9 @@ enum AppSettings {
             reopenLastRepositoryKey: true,
             ignoreWhitespaceKey: false,
             wrapDiffLinesKey: false,
+            listEachUntrackedFileKey: true,
             commitMessageLanguageKey: defaultCommitMessageLanguage.rawValue,
+            branchOrderKey: BranchOrder.lastCommit.rawValue,
         ])
     }
 
@@ -87,9 +91,45 @@ enum AppSettings {
         UserDefaults.standard.bool(forKey: wrapDiffLinesKey)
     }
 
+    /// 未追跡フォルダの中をファイルごとに出す。切るとフォルダ1件にまとめる。
+    static var listEachUntrackedFile: Bool {
+        UserDefaults.standard.bool(forKey: listEachUntrackedFileKey)
+    }
+
     nonisolated static var commitMessageLanguage: CommitMessageLanguage {
         CommitMessageLanguage(rawValue: UserDefaults.standard.string(forKey: commitMessageLanguageKey) ?? "")
             ?? defaultCommitMessageLanguage
+    }
+}
+
+/// サイドバーとリモートブランチのシートで使う並び順。
+nonisolated enum BranchOrder: String, CaseIterable, Identifiable, Sendable {
+    case name
+    case lastCommit
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .name: String(localized: "Name")
+        case .lastCommit: String(localized: "Last Commit Date")
+        }
+    }
+
+    func sorted(_ branches: [Branch]) -> [Branch] {
+        switch self {
+        case .name:
+            branches.sorted { $0.name < $1.name }
+        case .lastCommit:
+            branches.sorted { lhs, rhs in
+                switch (lhs.committedAt, rhs.committedAt) {
+                case let (left?, right?) where left != right:
+                    return left > right
+                default:
+                    return lhs.name < rhs.name
+                }
+            }
+        }
     }
 }
 

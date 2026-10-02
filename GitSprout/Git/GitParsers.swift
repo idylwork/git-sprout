@@ -55,12 +55,13 @@ nonisolated enum GitLogParser {
         var commits: [CommitRecord] = []
         commits.reserveCapacity(records.count)
         for record in records {
-            // `format:` はレコード区切りのあとに改行を足す。
+            // `format:` はレコード区切りのあとに改行を足す
             let cleaned = record.drop(while: \.isNewline)
             let fields = cleaned.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
             guard fields.count >= 7, !fields[0].isEmpty else { continue }
             let parents = fields[1].split(separator: " ").map(String.init).filter { !$0.isEmpty }
-            let subject = fields[6...].joined(separator: "\u{1f}")
+            let subject = fields[6]
+            let body = fields.count > 7 ? normalizeBody(fields[7...].joined(separator: "\u{1f}")) : ""
             commits.append(CommitRecord(
                 oid: fields[0],
                 parents: parents,
@@ -68,10 +69,23 @@ nonisolated enum GitLogParser {
                 authorEmail: fields[3],
                 authoredAt: formatter.date(from: fields[4]) ?? .distantPast,
                 decoration: displayDecoration(fields[5]),
-                subject: subject
+                subject: subject,
+                body: body
             ))
         }
         return commits
+    }
+
+    /// `%b` は本文の末尾に改行を付ける。先頭の空行と末尾の改行だけ除く。
+    private static func normalizeBody(_ raw: String) -> String {
+        var text = Substring(raw)
+        while text.first?.isNewline == true {
+            text.removeFirst()
+        }
+        while text.last?.isNewline == true {
+            text.removeLast()
+        }
+        return String(text)
     }
 }
 
@@ -108,14 +122,81 @@ nonisolated enum GitBranchParser {
                 oid: fields[1],
                 isCurrent: fields[2].contains("*"),
                 upstream: fields.count > 3 ? nonempty(fields[3]) : nil,
-                remoteName: fields.count > 4 ? nonempty(fields[4]) : nil
+                remoteName: fields.count > 4 ? nonempty(fields[4]) : nil,
+                sync: fields.count > 5 ? sync(from: fields[5]) : .unknown,
+                subject: fields.count > 7 ? fields[7...].joined(separator: "\t") : "",
+                committedAt: fields.count > 6 ? date(from: fields[6]) : nil
             )
         }
+    }
+
+    /// `%(upstream:track)` の `[ahead N]`、`[behind M]`、`[ahead N, behind M]`、`=` を読む。
+    static func sync(from track: String) -> BranchSync {
+        let ahead = count(track, label: "ahead ")
+        let behind = count(track, label: "behind ")
+        if ahead > 0, behind > 0 { return .diverged(ahead: ahead, behind: behind) }
+        if ahead > 0 { return .ahead(ahead) }
+        if behind > 0 { return .behind(behind) }
+        if track.trimmingCharacters(in: .whitespacesAndNewlines) == "=" { return .upToDate }
+        return .unknown
+    }
+
+    private static func count(_ track: String, label: String) -> Int {
+        guard let range = track.range(of: label) else { return 0 }
+        var value = 0
+        var sawDigit = false
+        for character in track[range.upperBound...] {
+            guard character.isNumber, let digit = character.wholeNumberValue else { break }
+            sawDigit = true
+            value = value * 10 + digit
+        }
+        return sawDigit ? value : 0
     }
 
     private static func nonempty(_ field: String) -> String? {
         let trimmed = field.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func date(from field: String) -> Date? {
+        let trimmed = field.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let seconds = TimeInterval(trimmed), seconds > 0 else { return nil }
+        return Date(timeIntervalSince1970: seconds)
+    }
+}
+
+nonisolated struct RemoteHead: Sendable, Equatable {
+    var remote: String
+    var name: String
+    var oid: String
+    var subject: String = ""
+    var committedAt: Date? = nil
+}
+
+nonisolated enum GitRemoteHeadParser {
+    static func parse(_ data: Data) -> [RemoteHead] {
+        let text = String(decoding: data, as: UTF8.self)
+        return text.split(whereSeparator: \.isNewline).compactMap { line in
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard fields.count >= 2, let slash = fields[0].firstIndex(of: "/") else { return nil }
+            let remote = String(fields[0][..<slash])
+            let name = String(fields[0][fields[0].index(after: slash)...])
+            guard !remote.isEmpty, !name.isEmpty, name != "HEAD" else { return nil }
+            return RemoteHead(
+                remote: remote,
+                name: name,
+                oid: fields[1],
+                subject: fields.count > 3 ? fields[3...].joined(separator: "\t") : "",
+                committedAt: fields.count > 2 ? GitBranchParser.date(from: fields[2]) : nil
+            )
+        }
+    }
+
+    /// 同名の追跡先。origin を優先し、origin が無く候補が複数なら決めない。
+    static func match(name: String, heads: [RemoteHead]) -> RemoteHead? {
+        let matches = heads.filter { $0.name == name }
+        if let origin = matches.first(where: { $0.remote == "origin" }) { return origin }
+        return matches.count == 1 ? matches[0] : nil
     }
 }
 
@@ -379,6 +460,28 @@ nonisolated enum DiffLinePatch {
         case .context: return " " + line.text
         case .meta: return line.text
         }
+    }
+}
+
+/// `git ls-files -s -z` から、ステージ 0 の通常ファイルを取る。
+nonisolated enum IndexStageParser {
+    static func regularBlob(_ data: Data) -> (mode: String, hash: String)? {
+        var cursor = data.startIndex
+        while cursor < data.endIndex {
+            guard let tab = data[cursor...].firstIndex(of: 0x09),
+                  let nul = data[tab...].firstIndex(of: 0x00) else { return nil }
+            let header = String(decoding: data[cursor..<tab], as: UTF8.self)
+            let fields = header.split(separator: " ", omittingEmptySubsequences: true)
+            if fields.count >= 3, fields[2] == "0" {
+                let mode = String(fields[0])
+                guard mode == "100644" || mode == "100755" else { return nil }
+                return (mode, String(fields[1]))
+            }
+            let next = data.index(after: nul)
+            if next <= cursor { return nil }
+            cursor = next
+        }
+        return nil
     }
 }
 

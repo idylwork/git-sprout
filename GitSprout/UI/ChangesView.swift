@@ -73,15 +73,7 @@ struct WorktreeFileList: View {
                 checked: false,
                 trailingDisabled: session.unstagedChanges.isEmpty,
                 onTrailing: { Task { await session.stage(paths: session.unstagedChanges.map(\.path)) } },
-                menu: [
-                    SectionMenuItem(
-                        id: "discard",
-                        title: String(localized: "Discard Unstaged Changes"),
-                        destructive: true,
-                        disabled: session.unstagedChanges.isEmpty,
-                        action: { session.pendingConfirm = .discardAllUnstaged }
-                    )
-                ]
+                menu: unstagedMenu
             )
         ]
     }
@@ -118,6 +110,24 @@ struct WorktreeFileList: View {
             )
         )
         return menu
+    }
+
+    private var unstagedMenu: [SectionMenuItem] {
+        [
+            SectionMenuItem(
+                id: "stash",
+                title: String(localized: "Stash Unstaged Changes"),
+                disabled: session.unstagedChanges.isEmpty,
+                action: { Task { await session.createStash(message: "", unstagedOnly: true) } }
+            ),
+            SectionMenuItem(
+                id: "discard",
+                title: String(localized: "Discard Unstaged Changes"),
+                destructive: true,
+                disabled: session.unstagedChanges.isEmpty,
+                action: { session.pendingConfirm = .discardAllUnstaged }
+            )
+        ]
     }
 
     private func listed(_ file: FileChange, staged: Bool) -> ListedFile {
@@ -181,10 +191,7 @@ private struct CommitComposer: View {
                 .font(.headline)
             editor
             if let failure {
-                Text(failure)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                CappedErrorText(text: failure)
             }
             HStack {
                 if canSuggest {
@@ -323,6 +330,50 @@ private struct CommitComposer: View {
     }
 }
 
+/// 長いエラーでもシートが画面外まで伸びないよう、本文の高さで測って上限内に収める。
+private struct CappedErrorText: View {
+    var text: String
+    var maxHeight: CGFloat = 140
+
+    var body: some View {
+        VerticallyCappedScroll(maxHeight: maxHeight) {
+            content.hidden()
+            ScrollView {
+                content
+            }
+            .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+
+    private var content: some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(.red)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// スクロールビューは中身の高さを返さないので、隠した本文を測って表示高さを決める。
+private struct VerticallyCappedScroll: Layout {
+    var maxHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let probe = subviews[0]
+        let content = probe.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        return CGSize(width: proposal.width ?? content.width, height: min(content.height, maxHeight))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: 0))
+        subviews[1].place(
+            at: bounds.origin,
+            proposal: ProposedViewSize(width: bounds.width, height: bounds.height)
+        )
+    }
+}
+
 private enum CommitDestination: Hashable {
     case new
     case previous
@@ -360,6 +411,10 @@ struct ChangesDiffView: View {
             } : nil,
             onStageLines: file == nil ? nil : { patch in
                 Task { await session.stageLines(patch) }
+            },
+            onFixMissingNewline: file == nil ? nil : {
+                guard let file else { return }
+                Task { await session.appendTrailingNewline(path: file.path, staged: file.staged) }
             }
         )
     }

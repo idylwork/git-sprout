@@ -17,6 +17,8 @@ struct DiffView: View {
     var onPrimary: ((DiffHunk) -> Void)?
     var onSecondary: ((DiffHunk) -> Void)?
     var onStageLines: ((String) -> Void)? = nil
+    /// 作業ツリーまたはインデックスの末尾に、足りない改行を足す。
+    var onFixMissingNewline: (() -> Void)? = nil
 
     @AppStorage(AppSettings.wrapDiffLinesKey) private var wrapLines = false
     @State private var selectedLineIDs: Set<Int> = []
@@ -245,25 +247,38 @@ struct DiffView: View {
                     .frame(width: width, height: Self.lineHeight, alignment: .leading)
                     .background(rowBackground(line))
                     .contentShape(Rectangle())
-                    .onTapGesture { select(line) }
+                    .onTapGesture { activate(line) }
+                    .modifier(MissingNewlineHover(enabled: canFix(line)))
             }
         }
         .font(.system(size: Self.lineFontSize, design: .monospaced))
     }
 
     private func textColumn(_ hunk: DiffHunk, width: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(numbered(hunk)) { line in
-                Text(line.line.text)
-                    .lineLimit(1)
-                    .frame(width: width, height: Self.lineHeight, alignment: .leading)
-                    .background(rowBackground(line))
-                    .contentShape(Rectangle())
-                    .onTapGesture { select(line) }
+        let lines = numbered(hunk)
+        let height = CGFloat(lines.count) * Self.lineHeight
+        return ZStack(alignment: .topLeading) {
+            DiffTextColumn(
+                lines: lines,
+                selectedIDs: selectedLineIDs,
+                lineHeight: Self.lineHeight,
+                fontSize: Self.lineFontSize,
+                onSelect: { activate($0) },
+                onFixMissingNewline: actionsEnabled ? onFixMissingNewline : nil
+            )
+            ForEach(Array(lines.enumerated()), id: \.element.id) { index, line in
+                if line.missingNewline != nil {
+                    Image(systemName: "minus.circle")
+                        .font(.system(size: Self.lineFontSize))
+                        .foregroundStyle(line.missingNewline == .missing ? .red : .primary)
+                        .accessibilityHidden(true)
+                        .frame(width: Self.lineFontSize, height: Self.lineHeight, alignment: .center)
+                        .offset(y: CGFloat(index) * Self.lineHeight)
+                        .allowsHitTesting(false)
+                }
             }
         }
-        .font(.system(size: Self.lineFontSize, design: .monospaced))
-        .frame(width: width, alignment: .leading)
+        .frame(width: width, height: height, alignment: .topLeading)
     }
 
     private func horizontalBar(gutterWidth: CGFloat, columnWidth: CGFloat) -> some View {
@@ -285,8 +300,8 @@ struct DiffView: View {
                 .foregroundStyle(.secondary)
             Text(gutter(line.newNumber, width: newDigits))
                 .foregroundStyle(.secondary)
-            Text(line.line.prefix.isEmpty ? " " : line.line.prefix)
-                .foregroundStyle(markerColor(for: line.line.kind))
+            Text(markerText(line))
+                .foregroundStyle(markerColor(line))
         }
         .padding(.leading, 8)
         .padding(.trailing, 8)
@@ -300,22 +315,43 @@ struct DiffView: View {
         viewportWidth: CGFloat
     ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(gutter(line.oldNumber, width: oldDigits))
-                .foregroundStyle(.secondary)
-            Text(gutter(line.newNumber, width: newDigits))
-                .foregroundStyle(.secondary)
-            Text(line.line.prefix)
-                .foregroundStyle(markerColor(for: line.line.kind))
-            Text(line.line.text)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(gutter(line.oldNumber, width: oldDigits))
+                    .foregroundStyle(.secondary)
+                Text(gutter(line.newNumber, width: newDigits))
+                    .foregroundStyle(.secondary)
+                Text(markerText(line))
+                    .foregroundStyle(markerColor(line))
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { activate(line) }
+            wrappedLineText(line)
         }
         .font(.system(size: Self.lineFontSize, design: .monospaced))
         .padding(.horizontal, 8)
         .frame(width: viewportWidth, alignment: .leading)
         .background(rowBackground(line))
-        .contentShape(Rectangle())
-        .onTapGesture { select(line) }
+        .modifier(MissingNewlineHover(enabled: canFix(line)))
+    }
+
+    @ViewBuilder
+    private func wrappedLineText(_ line: NumberedDiffLine) -> some View {
+        if line.missingNewline != nil {
+            HStack(spacing: 4) {
+                Image(systemName: "minus.circle")
+                    .foregroundStyle(line.missingNewline == .missing ? .red : .primary)
+                    .accessibilityHidden(true)
+                Text(verbatim: MissingNewlineNote.title)
+                    .foregroundStyle(line.missingNewline == .missing ? .red : .primary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { activate(line) }
+        } else {
+            Text(line.line.text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private func measuredGutterWidth(oldDigits: Int, newDigits: Int) -> CGFloat {
@@ -339,7 +375,15 @@ struct DiffView: View {
         var longest: CGFloat = 0
         for hunk in document.hunks {
             for line in hunk.lines {
-                longest = max(longest, ceil((line.text as NSString).size(withAttributes: attributes).width))
+                let measured: CGFloat
+                if line.kind == .meta, line.text == MissingNewlineNote.rawLine {
+                    let title = MissingNewlineNote.title as NSString
+                    measured = ceil(title.size(withAttributes: attributes).width)
+                        + DiffColumnTextView.missingNewlineIndent
+                } else {
+                    measured = ceil((line.text as NSString).size(withAttributes: attributes).width)
+                }
+                longest = max(longest, measured)
             }
         }
         return max(minimum, longest + 12)
@@ -353,6 +397,28 @@ struct DiffView: View {
             selectionAnchor = nil
         }
         onStageLines?(patch)
+    }
+
+    private func canFix(_ line: NumberedDiffLine) -> Bool {
+        actionsEnabled && line.missingNewline == .missing && onFixMissingNewline != nil
+    }
+
+    private func activate(_ line: NumberedDiffLine) {
+        if canFix(line) {
+            onFixMissingNewline?()
+            return
+        }
+        select(line)
+    }
+
+    private func markerText(_ line: NumberedDiffLine) -> String {
+        if line.missingNewline == .resolved { return "-" }
+        return line.line.prefix.isEmpty ? " " : line.line.prefix
+    }
+
+    private func markerColor(_ line: NumberedDiffLine) -> Color {
+        if line.missingNewline == .resolved { return .red }
+        return markerColor(for: line.line.kind)
     }
 
     private func select(_ line: NumberedDiffLine) {
@@ -392,32 +458,38 @@ struct DiffView: View {
     }
 
     private func rowBackground(_ line: NumberedDiffLine) -> Color {
-        if selectedLineIDs.contains(line.line.id) {
-            return Color.accentColor.opacity(0.35)
-        }
-        return background(for: line.line.kind)
+        diffRowColor(
+            kind: line.line.kind,
+            missingNewline: line.missingNewline,
+            selected: selectedLineIDs.contains(line.line.id)
+        )
     }
 
     private func numbered(_ hunk: DiffHunk) -> [NumberedDiffLine] {
         var old = hunk.oldStart
         var new = hunk.newStart
+        var previous: DiffLine.Kind?
         return hunk.lines.map { line in
+            let note = MissingNewlineNote.state(of: line, previous: previous)
+            if line.kind != .meta {
+                previous = line.kind
+            }
             switch line.kind {
             case .context:
-                let item = NumberedDiffLine(line: line, oldNumber: old, newNumber: new)
+                let item = NumberedDiffLine(line: line, oldNumber: old, newNumber: new, missingNewline: note)
                 old += 1
                 new += 1
                 return item
             case .deletion:
-                let item = NumberedDiffLine(line: line, oldNumber: old, newNumber: nil)
+                let item = NumberedDiffLine(line: line, oldNumber: old, newNumber: nil, missingNewline: note)
                 old += 1
                 return item
             case .addition:
-                let item = NumberedDiffLine(line: line, oldNumber: nil, newNumber: new)
+                let item = NumberedDiffLine(line: line, oldNumber: nil, newNumber: new, missingNewline: note)
                 new += 1
                 return item
             case .meta:
-                return NumberedDiffLine(line: line, oldNumber: nil, newNumber: nil)
+                return NumberedDiffLine(line: line, oldNumber: nil, newNumber: nil, missingNewline: note)
             }
         }
     }
@@ -447,25 +519,297 @@ struct DiffView: View {
         }
     }
 
-    private func background(for kind: DiffLine.Kind) -> Color {
-        switch kind {
-        case .addition: return Color.green.opacity(0.16)
-        case .deletion: return Color.red.opacity(0.16)
-        case .meta: return Color.secondary.opacity(0.08)
-        case .context: return .clear
-        }
-    }
-
     private func unavailable(_ title: String, systemImage: String) -> some View {
         ContentUnavailableView(title, systemImage: systemImage)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
-private struct NumberedDiffLine: Identifiable {
+/// 差分の本文。行の高さはガターと揃え、ドラッグした範囲はコピーできる。
+private struct DiffTextColumn: NSViewRepresentable {
+    var lines: [NumberedDiffLine]
+    var selectedIDs: Set<Int>
+    var lineHeight: CGFloat
+    var fontSize: CGFloat
+    var onSelect: (NumberedDiffLine) -> Void
+    var onFixMissingNewline: (() -> Void)?
+
+    func makeNSView(context: Context) -> DiffColumnTextView {
+        DiffColumnTextView()
+    }
+
+    func updateNSView(_ view: DiffColumnTextView, context: Context) {
+        view.onSelect = onSelect
+        view.onFixMissingNewline = onFixMissingNewline
+        view.show(
+            lines: lines,
+            selectedIDs: selectedIDs,
+            fontSize: fontSize,
+            lineHeight: lineHeight,
+            width: view.bounds.width
+        )
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: DiffColumnTextView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? nsView.bounds.width, height: CGFloat(lines.count) * lineHeight)
+    }
+}
+
+final class DiffColumnTextView: NSTextView {
+    var lineHeight: CGFloat = 0
+    var onSelect: (NumberedDiffLine) -> Void = { _ in }
+    var onFixMissingNewline: (() -> Void)?
+    private var records: [NumberedDiffLine] = []
+    private var selectedIDs: Set<Int> = []
+    private var appliedText: String?
+    private var hoverTracking: NSTrackingArea?
+
+    override var isOpaque: Bool { false }
+
+    init() {
+        let storage = NSTextStorage()
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: NSSize(width: 1, height: CGFloat.greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        container.widthTracksTextView = true
+        container.heightTracksTextView = false
+        layout.addTextContainer(container)
+        super.init(frame: .zero, textContainer: container)
+        isEditable = false
+        isSelectable = true
+        isRichText = true
+        drawsBackground = false
+        isVerticallyResizable = false
+        isHorizontallyResizable = false
+        textContainerInset = .zero
+        focusRingType = .none
+        isAutomaticQuoteSubstitutionEnabled = false
+        isAutomaticLinkDetectionEnabled = false
+        isAutomaticDataDetectionEnabled = false
+        usesFindBar = false
+        usesFontPanel = false
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func show(
+        lines: [NumberedDiffLine],
+        selectedIDs: Set<Int>,
+        fontSize: CGFloat,
+        lineHeight: CGFloat,
+        width: CGFloat
+    ) {
+        records = lines
+        self.selectedIDs = selectedIDs
+        self.lineHeight = lineHeight
+        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        let parts = lines.map { line -> (text: String, red: Bool, indent: CGFloat) in
+            guard let note = line.missingNewline else {
+                return (line.line.text, false, 0)
+            }
+            return (MissingNewlineNote.title, note == .missing, Self.missingNewlineIndent)
+        }
+        apply(parts: parts, font: font, lineHeight: lineHeight, width: width)
+        needsDisplay = true
+    }
+
+    /// 行頭アイコンと文字の重なりを避ける字下げ。
+    static let missingNewlineIndent: CGFloat = 16
+
+    func apply(texts: [String], font: NSFont, lineHeight: CGFloat, width: CGFloat) {
+        apply(parts: texts.map { ($0, false, 0) }, font: font, lineHeight: lineHeight, width: width)
+    }
+
+    func apply(parts: [(text: String, red: Bool, indent: CGFloat)], font: NSFont, lineHeight: CGFloat, width: CGFloat) {
+        self.lineHeight = lineHeight
+        let style = NSMutableParagraphStyle()
+        style.minimumLineHeight = lineHeight
+        style.maximumLineHeight = lineHeight
+        style.lineSpacing = 0
+        style.paragraphSpacing = 0
+        style.paragraphSpacingBefore = 0
+        style.lineBreakMode = .byClipping
+        func attributes(red: Bool, indent: CGFloat) -> [NSAttributedString.Key: Any] {
+            let paragraph = style.mutableCopy() as! NSMutableParagraphStyle
+            paragraph.firstLineHeadIndent = indent
+            paragraph.headIndent = indent
+            return [
+                .font: font,
+                .foregroundColor: red ? NSColor.systemRed : NSColor.labelColor,
+                .paragraphStyle: paragraph
+            ]
+        }
+        let key = parts.map { "\($0.red ? "r" : "k")\($0.indent)\($0.text)" }.joined(separator: "\n")
+        if key != appliedText {
+            let storage = NSMutableAttributedString()
+            for (index, part) in parts.enumerated() {
+                if index > 0 {
+                    storage.append(NSAttributedString(string: "\n", attributes: attributes(red: false, indent: 0)))
+                }
+                storage.append(NSAttributedString(string: part.text, attributes: attributes(red: part.red, indent: part.indent)))
+            }
+            textStorage?.setAttributedString(storage)
+            appliedText = key
+            setSelectedRange(NSRange(location: 0, length: 0))
+        }
+        let containerWidth = max(width, bounds.width, 1)
+        textContainer?.containerSize = NSSize(width: containerWidth, height: CGFloat.greatestFiniteMagnitude)
+        layoutManager?.ensureLayout(for: textContainer!)
+    }
+
+    func lineFragmentOrigins() -> [CGFloat] {
+        guard let layout = layoutManager, let container = textContainer else { return [] }
+        layout.ensureLayout(for: container)
+        var origins: [CGFloat] = []
+        var index = 0
+        let count = layout.numberOfGlyphs
+        while index < count {
+            var range = NSRange()
+            let rect = layout.lineFragmentRect(forGlyphAt: index, effectiveRange: &range, withoutAdditionalLayout: true)
+            origins.append(rect.origin.y)
+            let next = NSMaxRange(range)
+            if next <= index { break }
+            index = next
+        }
+        return origins
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        drawLineBackgrounds(in: dirtyRect)
+        super.draw(dirtyRect)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking {
+            removeTrackingArea(hoverTracking)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .cursorUpdate, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        if fixable(at: event) {
+            NSCursor.pointingHand.set()
+        } else {
+            super.cursorUpdate(with: event)
+        }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let fixing = fixable(at: event)
+        let tip = fixing ? String(localized: "Add a newline at the end of the file") : nil
+        if toolTip != tip { toolTip = tip }
+        if fixing {
+            NSCursor.pointingHand.set()
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        toolTip = nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let index = lineIndex(for: event)
+        let fixing = isFixable(index)
+        let previous = window?.firstResponder
+        super.mouseDown(with: event)
+        guard selectedRange().length == 0 else { return }
+        if fixing {
+            onFixMissingNewline?()
+        } else if let index {
+            onSelect(records[index])
+        } else {
+            return
+        }
+        if let previous, previous !== self {
+            window?.makeFirstResponder(previous)
+        }
+    }
+
+    private func lineIndex(for event: NSEvent) -> Int? {
+        guard lineHeight > 0 else { return nil }
+        let point = convert(event.locationInWindow, from: nil)
+        let index = Int(floor(point.y / lineHeight))
+        guard records.indices.contains(index) else { return nil }
+        return index
+    }
+
+    private func fixable(at event: NSEvent) -> Bool {
+        isFixable(lineIndex(for: event))
+    }
+
+    private func isFixable(_ index: Int?) -> Bool {
+        guard let index, onFixMissingNewline != nil else { return false }
+        return records[index].missingNewline == .missing
+    }
+
+    private func drawLineBackgrounds(in dirty: NSRect) {
+        guard lineHeight > 0 else { return }
+        for (index, line) in records.enumerated() {
+            let rect = NSRect(x: 0, y: CGFloat(index) * lineHeight, width: bounds.width, height: lineHeight)
+            guard rect.intersects(dirty) else { continue }
+            let color = fillColor(for: line)
+            guard color.alphaComponent > 0.001 else { continue }
+            color.setFill()
+            rect.fill()
+        }
+    }
+
+    private func fillColor(for line: NumberedDiffLine) -> NSColor {
+        NSColor(diffRowColor(
+            kind: line.line.kind,
+            missingNewline: line.missingNewline,
+            selected: selectedIDs.contains(line.id)
+        ))
+    }
+}
+
+struct NumberedDiffLine: Identifiable {
     var line: DiffLine
     var oldNumber: Int?
     var newNumber: Int?
+    var missingNewline: MissingNewlineNote?
 
     var id: Int { line.id }
+}
+
+fileprivate func diffRowColor(kind: DiffLine.Kind, missingNewline: MissingNewlineNote?, selected: Bool) -> Color {
+    if selected { return Color.accentColor.opacity(0.35) }
+    if missingNewline == .resolved { return Color.red.opacity(0.16) }
+    switch kind {
+    case .addition: return Color.green.opacity(0.16)
+    case .deletion: return Color.red.opacity(0.16)
+    case .meta: return Color.secondary.opacity(0.08)
+    case .context: return .clear
+    }
+}
+
+private struct MissingNewlineHover: ViewModifier {
+    var enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content
+                .help("Add a newline at the end of the file")
+                .onHover { inside in
+                    if inside {
+                        NSCursor.pointingHand.set()
+                    } else {
+                        NSCursor.arrow.set()
+                    }
+                }
+        } else {
+            content
+        }
+    }
 }

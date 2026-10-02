@@ -18,6 +18,8 @@ struct ChangedFilesSplit<Header: View>: View {
     var commitOID: String?
     var onSelect: (String) -> Void
     var onOpenHistory: (String) -> Void
+    var sectionTitle = String(localized: "Changed Files")
+    var menu: [SectionMenuItem] = []
     @ViewBuilder var header: () -> Header
 
     var body: some View {
@@ -69,14 +71,15 @@ struct ChangedFilesSplit<Header: View>: View {
                 sections: [
                     FileSection(
                         id: listID,
-                        title: String(localized: "Changed Files"),
+                        title: sectionTitle,
                         files: files.map { file in
                             ListedFile(
                                 selection: FileSelection(path: file.path, staged: false, commitOID: commitOID),
                                 displayPath: file.displayPath,
                                 statusLabel: file.code
                             )
-                        }
+                        },
+                        menu: menu
                     )
                 ],
                 isMutating: isMutating,

@@ -12,6 +12,7 @@ struct SectionMenuItem: Identifiable {
     var destructive = false
     var disabled = false
     var shortcut: KeyboardShortcut?
+    var dividerBefore = false
     var action: () -> Void
 }
 
@@ -36,6 +37,8 @@ struct ListedFile: Identifiable, Hashable {
 
 /// 変更一覧と履歴で共用するファイルリスト。
 /// クリックで差分を出し、この一覧にフォーカスがあるときだけスペースでステージ、上下キーで選択を動かす。
+/// Shift を押した上下は、起点から範囲を伸ばして複数選択する。
+/// 複数選択中のスペースはリストが先に消費するため、一覧側で受け取ってまとめて切り替える。
 struct FileActionList: View {
     var sections: [FileSection]
     var isMutating: Bool
@@ -49,6 +52,7 @@ struct FileActionList: View {
     @Environment(\.keyboardFocus) private var keyboardFocus
     @State private var selection: Set<FileSelection> = []
     @State private var selectionAnchor: FileSelection?
+    @State private var selectionLead: FileSelection?
 
     var body: some View {
         List(selection: $selection) {
@@ -98,24 +102,39 @@ struct FileActionList: View {
         .keyboardTarget(.files)
         .onAppear { keyboardFocus?.claimIfIdle(.files) }
         .onChange(of: selection) { old, new in
-            let added = new.subtracting(old)
-            onFocus(added.first ?? new.first)
+            if let lead = selectionLead, new.contains(lead) {
+                onFocus(lead)
+            } else {
+                let added = new.subtracting(old)
+                onFocus(added.first ?? new.first)
+            }
         }
         .onChange(of: order) { _, valid in
             retarget(valid)
         }
-        .selectionArrows(target: .files) { delta in
-            nudge(delta)
+        .selectionArrows(target: .files) { delta, extending in
+            nudge(delta, extending: extending)
         }
         .onKeyPress(.space) {
             guard keyboardFocus?.target == .files, allowsStage, !selection.isEmpty, !isMutating else { return .ignored }
             onToggle(Array(selection))
             return .handled
         }
+        .background {
+            if allowsStage {
+                FileListSpaceMonitor(enabled: !isMutating && selection.count > 1) {
+                    onToggle(Array(selection))
+                }
+                .allowsHitTesting(false)
+            }
+        }
     }
 
     @ViewBuilder
     private func menuButton(_ item: SectionMenuItem) -> some View {
+        if item.dividerBefore {
+            Divider()
+        }
         let button = Button(item.title, role: item.destructive ? .destructive : nil, action: item.action)
             .disabled(item.disabled || isMutating)
         if let shortcut = item.shortcut {
@@ -239,30 +258,32 @@ struct FileActionList: View {
                 selection.insert(file)
             }
             selectionAnchor = file
+            selectionLead = file
         } else if flags.contains(.shift),
                   let anchor = selectionAnchor ?? selection.first,
                   let start = order.firstIndex(of: anchor),
                   let end = order.firstIndex(of: file) {
+            selectionAnchor = anchor
+            selectionLead = file
             selection = Set(order[min(start, end)...max(start, end)])
         } else {
-            selection = [file]
             selectionAnchor = file
+            selectionLead = file
+            selection = [file]
         }
         keyboardFocus?.target = .files
     }
 
-    private func nudge(_ delta: Int) {
-        let files = order
-        guard !files.isEmpty else { return }
-        let start: Int
-        if selection.count == 1, let current = selection.first, let index = files.firstIndex(of: current) {
-            start = index
-        } else {
-            start = delta > 0 ? -1 : files.count
-        }
-        let next = files[min(max(0, start + delta), files.count - 1)]
-        selection = [next]
-        selectionAnchor = next
+    private func nudge(_ delta: Int, extending: Bool) {
+        let cursor = SelectionStep.move(
+            SelectionCursor(selection: selection, anchor: selectionAnchor, lead: selectionLead),
+            in: order,
+            delta: delta,
+            extending: extending
+        )
+        selectionAnchor = cursor.anchor
+        selectionLead = cursor.lead
+        selection = cursor.selection
     }
 
     private func retarget(_ valid: [FileSelection]) {
@@ -270,16 +291,156 @@ struct FileActionList: View {
         guard !selection.isSubset(of: available) else { return }
         var next = Set<FileSelection>()
         for item in selection {
-            if available.contains(item) {
-                next.insert(item)
-            } else if item.commitOID == nil {
-                let flipped = FileSelection(path: item.path, staged: !item.staged)
-                if available.contains(flipped) {
-                    next.insert(flipped)
-                }
+            if let resolved = resolve(item, in: available) {
+                next.insert(resolved)
             }
         }
+        selectionAnchor = selectionAnchor.flatMap { resolve($0, in: available) }
+        selectionLead = selectionLead.flatMap { resolve($0, in: available) }
         selection = next
+    }
+
+    private func resolve(_ item: FileSelection, in available: Set<FileSelection>) -> FileSelection? {
+        if available.contains(item) { return item }
+        guard item.commitOID == nil else { return nil }
+        let flipped = FileSelection(path: item.path, staged: !item.staged)
+        return available.contains(flipped) ? flipped : nil
+    }
+}
+
+/// 複数行を選んでいるとき、リストはスペースをステージ操作まで届けない。先に受け取って選択全体を切り替える。
+private struct FileListSpaceMonitor: NSViewRepresentable {
+    var enabled: Bool
+    var onSpace: () -> Void
+
+    func makeNSView(context: Context) -> SpaceMonitorView {
+        let view = SpaceMonitorView()
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        return view
+    }
+
+    func updateNSView(_ view: SpaceMonitorView, context: Context) {
+        view.enabled = enabled
+        view.onSpace = onSpace
+    }
+}
+
+private final class SpaceMonitorView: NSView {
+    var enabled = false
+    var onSpace: () -> Void = {}
+    // deinit は MainActor の外なので、監視の解除だけ分離する
+    private nonisolated(unsafe) var monitor: Any?
+    private static let spaceKeyCode: UInt16 = 49
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        uninstall()
+        guard window != nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.handle(event) else { return event }
+            return nil
+        }
+    }
+
+    deinit {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+
+    private func handle(_ event: NSEvent) -> Bool {
+        guard enabled, event.window === window, !event.isARepeat, event.keyCode == Self.spaceKeyCode else { return false }
+        let flags = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .subtracting(.capsLock)
+        guard flags.isEmpty else { return false }
+        guard let responder = window?.firstResponder as? NSView else { return false }
+        if responder is NSTextView || responder is NSButton { return false }
+        guard responderIsInList(responder) else { return false }
+        onSpace()
+        return true
+    }
+
+    /// この一覧のテーブルがキー入力を持っているときだけ受け取る。差分や隣の一覧には渡す。
+    private func responderIsInList(_ responder: NSView) -> Bool {
+        if let listScroll = listScrollView() {
+            if responder === listScroll || responder.enclosingScrollView === listScroll {
+                return true
+            }
+        }
+        return overlapsList(responder)
+    }
+
+    private func overlapsList(_ responder: NSView) -> Bool {
+        let target = convert(bounds, to: nil)
+        guard target.width > 8, target.height > 8 else { return false }
+        var current: NSView? = responder
+        while let view = current {
+            let frame = view.convert(view.bounds, to: nil)
+            let widthRatio = frame.width / target.width
+            if widthRatio > 0.7, widthRatio < 1.45 {
+                let hit = frame.intersection(target)
+                if hit.width > target.width * 0.5, hit.height > min(target.height, 40) * 0.5 {
+                    return true
+                }
+            }
+            if widthRatio >= 1.45 { break }
+            current = view.superview
+        }
+        return false
+    }
+
+    private func listScrollView() -> NSScrollView? {
+        let target = convert(bounds, to: nil)
+        if let scroll = enclosingScrollView, Self.scroll(scroll, matches: target), Self.containsTable(scroll) {
+            return scroll
+        }
+        guard let root = superview else { return nil }
+        return Self.findTableScroll(in: root, overlapping: target)
+    }
+
+    private static func findTableScroll(in view: NSView, overlapping target: NSRect) -> NSScrollView? {
+        if let scroll = view as? NSScrollView, scroll.matchesList(overlapping: target), containsTable(scroll) {
+            return scroll
+        }
+        for subview in view.subviews {
+            if let found = findTableScroll(in: subview, overlapping: target) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    private static func scroll(_ scroll: NSScrollView, matches target: NSRect) -> Bool {
+        scroll.matchesList(overlapping: target)
+    }
+
+    private static func containsTable(_ view: NSView) -> Bool {
+        if view is NSTableView { return true }
+        if let scroll = view as? NSScrollView, let document = scroll.documentView {
+            if document is NSTableView || containsTable(document) { return true }
+        }
+        return view.subviews.contains { containsTable($0) }
+    }
+
+    private func uninstall() {
+        guard let monitor else { return }
+        NSEvent.removeMonitor(monitor)
+        self.monitor = nil
+    }
+}
+
+private extension NSScrollView {
+    func matchesList(overlapping target: NSRect) -> Bool {
+        guard target.width > 8, target.height > 8 else { return false }
+        let frame = convert(bounds, to: nil)
+        let widthRatio = frame.width / target.width
+        guard widthRatio > 0.7, widthRatio < 1.45 else { return false }
+        let hit = frame.intersection(target)
+        return hit.width > target.width * 0.5 && hit.height > min(target.height, 40) * 0.5
     }
 }
 
@@ -343,6 +504,7 @@ struct FileDiffPane: View {
     var onPrimaryHunk: ((DiffHunk) -> Void)?
     var onSecondaryHunk: ((DiffHunk) -> Void)?
     var onStageLines: ((String) -> Void)?
+    var onFixMissingNewline: (() -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -381,7 +543,8 @@ struct FileDiffPane: View {
                 actionsEnabled: actionsEnabled,
                 onPrimary: onPrimaryHunk,
                 onSecondary: onSecondaryHunk,
-                onStageLines: onStageLines
+                onStageLines: onStageLines,
+                onFixMissingNewline: onFixMissingNewline
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }

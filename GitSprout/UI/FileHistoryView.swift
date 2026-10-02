@@ -41,7 +41,7 @@ struct FileHistoryView: View {
                         .listRowBackground(session.selectedFileRevision == commit.oid ? Color.accentColor.opacity(0.18) : Color.clear)
                     }
                     .keyboardTarget(.fileHistory, focusable: true)
-                    .selectionArrows(target: .fileHistory) { delta in
+                    .selectionArrows(target: .fileHistory) { delta, _ in
                         moveRevision(delta, proxy: proxy)
                     }
                     .onAppear { keyboardFocus?.target = .fileHistory }

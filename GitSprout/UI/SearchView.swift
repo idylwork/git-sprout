@@ -159,7 +159,7 @@ struct SearchView: View {
 private extension View {
     func searchKeys(proxy: ScrollViewProxy, move: @escaping (Int, ScrollViewProxy) -> Void) -> some View {
         keyboardTarget(.search)
-            .selectionArrows(target: .search) { delta in
+            .selectionArrows(target: .search) { delta, _ in
                 move(delta, proxy)
             }
     }

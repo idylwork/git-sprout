@@ -22,6 +22,59 @@ struct SelectionStepTests {
         #expect(SelectionStep.index(of: "a", in: [String](), delta: 1) == nil)
         #expect(SelectionStep.index(of: "a", in: items, delta: 0) == nil)
     }
+
+    @Test func shiftExtendsFromTheAnchorAndPlainArrowCollapsesToTheLead() {
+        let items = ["a", "b", "c", "d"]
+        var cursor = SelectionCursor(selection: ["b"], anchor: "b", lead: "b")
+        cursor = SelectionStep.move(cursor, in: items, delta: 1, extending: true)
+        #expect(cursor.selection == ["b", "c"])
+        #expect(cursor.anchor == "b")
+        #expect(cursor.lead == "c")
+        cursor = SelectionStep.move(cursor, in: items, delta: 1, extending: true)
+        #expect(cursor.selection == ["b", "c", "d"])
+        #expect(cursor.lead == "d")
+        cursor = SelectionStep.move(cursor, in: items, delta: -1, extending: true)
+        #expect(cursor.selection == ["b", "c"])
+        #expect(cursor.lead == "c")
+        cursor = SelectionStep.move(cursor, in: items, delta: -1, extending: true)
+        #expect(cursor.selection == ["b"])
+        cursor = SelectionStep.move(cursor, in: items, delta: -1, extending: true)
+        #expect(cursor.selection == ["a", "b"])
+        #expect(cursor.anchor == "b")
+        #expect(cursor.lead == "a")
+        cursor = SelectionStep.move(cursor, in: items, delta: 1, extending: false)
+        #expect(cursor.selection == ["b"])
+        #expect(cursor.anchor == "b")
+        #expect(cursor.lead == "b")
+    }
+
+    @Test func extendingClampsAtTheEndsAndSelectsTheFirstItemFromEmpty() {
+        let items = ["a", "b"]
+        let atEnd = SelectionStep.move(
+            SelectionCursor(selection: ["a", "b"], anchor: "a", lead: "b"),
+            in: items,
+            delta: 1,
+            extending: true
+        )
+        #expect(atEnd.selection == ["a", "b"])
+        #expect(atEnd.lead == "b")
+        let fromEmpty = SelectionStep.move(
+            SelectionCursor(selection: [], anchor: nil, lead: nil),
+            in: items,
+            delta: 1,
+            extending: true
+        )
+        #expect(fromEmpty.selection == ["a"])
+        #expect(fromEmpty.anchor == "a")
+        #expect(fromEmpty.lead == "a")
+        let upward = SelectionStep.move(
+            SelectionCursor(selection: [], anchor: nil, lead: nil),
+            in: items,
+            delta: -1,
+            extending: true
+        )
+        #expect(upward.selection == ["b"])
+    }
 }
 
 struct OpenDocumentEventTests {
@@ -405,6 +458,28 @@ struct ParserTests {
         }
     }
 
+    @Test func missingNewlineLineStaysOnTheGutterPitch() throws {
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let lineHeight = ceil(font.boundingRectForFont.height)
+        let note = DiffLine(id: 1, kind: .meta, text: MissingNewlineNote.rawLine)
+        let lines = [
+            NumberedDiffLine(line: DiffLine(id: 0, kind: .addition, text: "alpha"), oldNumber: nil, newNumber: 1, missingNewline: nil),
+            NumberedDiffLine(line: note, oldNumber: nil, newNumber: nil, missingNewline: .missing)
+        ]
+        let view = DiffColumnTextView()
+        view.frame = NSRect(x: 0, y: 0, width: 640, height: lineHeight * CGFloat(lines.count))
+        view.show(lines: lines, selectedIDs: [], fontSize: 12, lineHeight: lineHeight, width: 640)
+        let origins = view.lineFragmentOrigins()
+        #expect(origins.count == lines.count)
+        let shown = view.string.split(separator: "\n", omittingEmptySubsequences: false)
+        #expect(shown.count == 2)
+        #expect(shown[1] == Substring(MissingNewlineNote.title))
+        let layout = try #require(view.layoutManager)
+        let range = (view.string as NSString).range(of: MissingNewlineNote.title)
+        let origin = layout.location(forGlyphAt: layout.glyphIndexForCharacter(at: range.location))
+        #expect(abs(origin.x - DiffColumnTextView.missingNewlineIndent) < 1)
+    }
+
     @Test func diffParserSplitsHunks() {
         let patch = """
         diff --git a/hello.txt b/hello.txt
@@ -428,6 +503,28 @@ struct ParserTests {
         #expect(partial?.contains("-old") == true)
         #expect(partial?.contains("+extra") == true)
         #expect(partial?.contains("+new") == false)
+    }
+
+    @Test func missingNewlineNoteFollowsThePreviousLine() {
+        let patch = """
+        diff --git a/hello.txt b/hello.txt
+        --- a/hello.txt
+        +++ b/hello.txt
+        @@ -1 +1 @@
+        -old
+        \\ No newline at end of file
+        +new
+        \\ No newline at end of file
+        """
+        let document = GitDiffParser.parse(Data(patch.utf8))
+        let lines = document.hunks[0].lines
+        #expect(lines.map(\.kind) == [.deletion, .meta, .addition, .meta])
+        #expect(lines[1].text == MissingNewlineNote.rawLine)
+        #expect(MissingNewlineNote.state(of: lines[1], previous: .deletion) == .resolved)
+        #expect(MissingNewlineNote.state(of: lines[3], previous: .addition) == .missing)
+        #expect(MissingNewlineNote.state(of: lines[3], previous: .context) == .missing)
+        let partial = DiffLinePatch.make(document: document, selectedIDs: [lines[0].id])
+        #expect(partial?.contains(MissingNewlineNote.rawLine) == true)
     }
 
     @Test func diffParserKeepsRenameAsOneChange() {
@@ -474,9 +571,28 @@ struct ParserTests {
         #expect(branches[0].isCurrent)
         #expect(!branches[1].isCurrent)
         #expect(branches[0].upstream == nil)
-        let tracked = GitBranchParser.parse(Data("main\tabc\t*\torigin/main\torigin\n".utf8))
+        let tracked = GitBranchParser.parse(Data("main\tabc\t*\torigin/main\torigin\t[ahead 2, behind 1]\nfeature\tdef\t \torigin/feature\torigin\t[ahead 1]\nsame\tghi\t \torigin/same\torigin\t=\n".utf8))
         #expect(tracked[0].upstream == "origin/main")
         #expect(tracked[0].remoteName == "origin")
+        #expect(tracked.map(\.sync) == [.diverged(ahead: 2, behind: 1), .ahead(1), .upToDate])
+        #expect(GitBranchParser.sync(from: "[behind 3]") == .behind(3))
+        #expect(GitBranchParser.sync(from: "") == .unknown)
+        let detailed = GitBranchParser.parse(Data("topic\tabc\t \t\t\t\t1700000000\tFix the parser\n".utf8))
+        #expect(detailed[0].subjectLine == "Fix the parser")
+        #expect(detailed[0].committedAt == Date(timeIntervalSince1970: 1_700_000_000))
+        let older = Branch(name: "zeta", oid: "a", isCurrent: false, committedAt: Date(timeIntervalSince1970: 10))
+        let newer = Branch(name: "alpha", oid: "b", isCurrent: false, committedAt: Date(timeIntervalSince1970: 20))
+        #expect(BranchOrder.lastCommit.sorted([older, newer]).map(\.name) == ["alpha", "zeta"])
+        #expect(BranchOrder.name.sorted([newer, older]).map(\.name) == ["alpha", "zeta"])
+        let heads = GitRemoteHeadParser.parse(Data("origin/HEAD\tabc\norigin/main\tdef\nupstream/main\tghi\nfork/topic\tjkl\n".utf8))
+        #expect(heads.map(\.name) == ["main", "main", "topic"])
+        #expect(GitRemoteHeadParser.match(name: "main", heads: heads)?.remote == "origin")
+        #expect(GitRemoteHeadParser.match(name: "topic", heads: heads)?.remote == "fork")
+        let ambiguous = [
+            RemoteHead(remote: "fork", name: "main", oid: "a"),
+            RemoteHead(remote: "upstream", name: "main", oid: "b")
+        ]
+        #expect(GitRemoteHeadParser.match(name: "main", heads: ambiguous) == nil)
         let stashes = GitStashParser.parse(Data("stash@{0}\u{1f}abc\u{1f}On main: demo\u{1e}".utf8))
         #expect(stashes.count == 1)
         #expect(stashes[0].ref == "stash@{0}")
@@ -667,6 +783,23 @@ struct GraphLayoutTests {
 }
 
 struct GitClientTests {
+    @Test func statusCanListUntrackedFoldersAsFiles() async throws {
+        let repo = try TemporaryRepo()
+        let folder = repo.root.appendingPathComponent("added", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try "a\n".write(to: folder.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        try "b\n".write(to: folder.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8)
+        let client = GitClient(workingDirectory: repo.root.path)
+
+        let each = try await client.status(listEachUntrackedFile: true)
+        #expect(each.files.contains { $0.path == "added/a.txt" && $0.unstaged == .untracked })
+        #expect(each.files.contains { $0.path == "added/b.txt" && $0.unstaged == .untracked })
+
+        let collapsed = try await client.status(listEachUntrackedFile: false)
+        #expect(collapsed.files.contains { $0.path == "added/" && $0.unstaged == .untracked })
+        #expect(!collapsed.files.contains { $0.path.hasPrefix("added/") && $0.path != "added/" })
+    }
+
     @Test func statusStageCommitLogDiffAndStash() async throws {
         let repo = try TemporaryRepo()
         let file = repo.root.appendingPathComponent("file name.txt")
@@ -791,6 +924,85 @@ struct GitClientTests {
         })
     }
 
+    @Test func stashUnstagedKeepsStagedChanges() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("file.txt")
+        let stagedOnly = repo.root.appendingPathComponent("staged only.txt")
+        let gone = repo.root.appendingPathComponent("gone.txt")
+        try "line1\nline2\nline3\n".write(to: file, atomically: true, encoding: .utf8)
+        try "kept\n".write(to: stagedOnly, atomically: true, encoding: .utf8)
+        try "gone\n".write(to: gone, atomically: true, encoding: .utf8)
+        try "secret.txt\n".write(to: repo.root.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
+        try repo.git(["add", "file.txt", "staged only.txt", "gone.txt", ".gitignore"])
+        try repo.git(["commit", "-m", "init"])
+        try "hidden\n".write(to: repo.root.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
+        try "line1 staged\nline2\nline3\n".write(to: file, atomically: true, encoding: .utf8)
+        try "kept staged\n".write(to: stagedOnly, atomically: true, encoding: .utf8)
+        try repo.git(["add", "file.txt", "staged only.txt"])
+        try "line1 staged\nline2 unstaged\nline3\n".write(to: file, atomically: true, encoding: .utf8)
+        try "new\n".write(to: repo.root.appendingPathComponent("brand new.txt"), atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: gone)
+
+        let client = GitClient(workingDirectory: repo.root.path)
+        let before = try await client.head()
+        try await client.stashPush(message: "demo", includeUntracked: true, unstagedOnly: true)
+
+        let stashed = try await client.status()
+        let partial = try #require(stashed.files.first { $0.path == "file.txt" })
+        #expect(partial.hasStaged)
+        #expect(!partial.hasUnstaged)
+        let staged = try #require(stashed.files.first { $0.path == "staged only.txt" })
+        #expect(staged.hasStaged)
+        #expect(!staged.hasUnstaged)
+        #expect(!stashed.files.contains { $0.path == "brand new.txt" || $0.path == "gone.txt" })
+        #expect(FileManager.default.fileExists(atPath: gone.path))
+        #expect(FileManager.default.fileExists(atPath: repo.root.appendingPathComponent("secret.txt").path))
+        let head = try await client.head()
+        #expect(head.oid == before.oid)
+
+        let ref = try #require(try await client.stashes().first)
+        #expect(ref.subject == "On main: demo")
+        let files = try await client.stashFiles(ref.ref)
+        #expect(files.values.map(\.path).sorted() == ["brand new.txt", "file.txt", "gone.txt"])
+        let tracked = try await client.stashFileDiff(ref: ref.ref, path: "file.txt")
+        #expect(tracked.hunks.contains { hunk in
+            hunk.lines.contains { $0.kind == .addition && $0.text == "line2 unstaged" }
+        })
+        #expect(!tracked.hunks.contains { hunk in
+            hunk.lines.contains { $0.kind == .addition && $0.text == "line1 staged" }
+        })
+
+        try await client.stashPop(ref.ref)
+        let restored = try await client.status()
+        let again = try #require(restored.files.first { $0.path == "file.txt" })
+        #expect(again.hasStaged)
+        #expect(again.hasUnstaged)
+        #expect(restored.files.contains { $0.path == "brand new.txt" && $0.unstaged == .untracked && !$0.hasStaged })
+        #expect(restored.files.contains { $0.path == "gone.txt" && $0.unstaged == .deleted })
+        #expect(restored.files.contains { $0.path == "staged only.txt" && $0.hasStaged && !$0.hasUnstaged })
+        #expect(FileManager.default.fileExists(atPath: repo.root.appendingPathComponent("secret.txt").path))
+    }
+
+    @Test func stashUnstagedCanLeaveUntrackedFiles() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("file.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "file.txt"])
+        try repo.git(["commit", "-m", "init"])
+        try "one\nstaged\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "file.txt"])
+        try "one\nstaged\nunstaged\n".write(to: file, atomically: true, encoding: .utf8)
+        try "keep\n".write(to: repo.root.appendingPathComponent("untracked.txt"), atomically: true, encoding: .utf8)
+        let client = GitClient(workingDirectory: repo.root.path)
+        try await client.stashPush(message: "demo", includeUntracked: false, unstagedOnly: true)
+        let status = try await client.status()
+        #expect(status.files.contains { $0.path == "file.txt" && $0.hasStaged && !$0.hasUnstaged })
+        #expect(status.files.contains { $0.path == "untracked.txt" && $0.unstaged == .untracked })
+        let ref = try #require(try await client.stashes().first?.ref)
+        let files = try await client.stashFiles(ref)
+        #expect(files.values.map(\.path) == ["file.txt"])
+    }
+
     @Test func checkIgnoreFollowsGitignoreAndKeepsTrackedFiles() async throws {
         let repo = try TemporaryRepo()
         try "secret.txt\n".write(to: repo.root.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
@@ -859,10 +1071,42 @@ struct GitClientTests {
 
         let found = try await client.searchCommits(query: "second")
         #expect(found.values.contains { $0.subject == "second" })
+        let second = try #require(found.values.first { $0.subject == "second" })
+        let byPrefix = try await client.searchCommits(query: String(second.oid.prefix(7)))
+        #expect(byPrefix.values.contains { $0.oid == second.oid })
+        let byFull = try await client.searchCommits(query: second.oid.uppercased())
+        #expect(byFull.values.contains { $0.oid == second.oid })
         let paths = try await client.searchPaths(query: "hello")
         #expect(paths.values == ["hello.txt"])
         let hits = try await client.searchContent(query: "three")
         #expect(hits.values.contains { $0.path == "hello.txt" })
+    }
+
+    @Test func undoHeadCommitKeepsTheChangeStaged() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "first"])
+        try "two\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "second"])
+
+        let client = GitClient(workingDirectory: repo.root.path)
+        let before = try await client.head()
+        try await client.undoHeadCommit()
+        let after = try await client.head()
+        #expect(after.oid != before.oid)
+        let status = try await client.status()
+        #expect(status.files.contains { $0.path == "hello.txt" && $0.hasStaged })
+        let log = try await client.log(skip: 0, limit: 10)
+        #expect(log.commits.map(\.subject) == ["first"])
+
+        let root = try #require(try await client.log(skip: 0, limit: 1).commits.first)
+        #expect(root.parents.isEmpty)
+        await #expect(throws: GitFailure.self) {
+            try await client.undoHeadCommit()
+        }
     }
 
     @Test func stageSelectedLinesWithinAHunk() async throws {
@@ -926,6 +1170,7 @@ struct GitClientTests {
         #expect(main.isCurrent)
         #expect(main.upstream == "origin/main")
         #expect(main.remoteName == "origin")
+        #expect(main.sync == .ahead(1))
 
         try await client.renameBranch("main", to: "trunk")
         #expect(try await client.head().name == "trunk")
@@ -938,6 +1183,7 @@ struct GitClientTests {
             try await client.deleteBranch("main")
         }
 
+        #expect(try await client.pullDivergence(branch: "main", upstream: "origin/main", remote: "origin") == .diverged)
         try await client.rebase(branch: "main", onto: "origin/main", remote: "origin")
         let rebased = try await client.log(skip: 0, limit: 3)
         #expect(Array(rebased.commits.prefix(2).map(\.subject)) == ["from-local", "from-remote"])
@@ -960,6 +1206,57 @@ struct GitClientTests {
         let resetSide = try #require(try await client.branches().first { $0.name == "side" })
         let resetMain = try #require(try await client.branches().first { $0.name == "main" })
         #expect(resetSide.oid == resetMain.oid)
+    }
+
+    @Test func createBranchPointsAtTheSourceAndStaysThere() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "first"])
+        try repo.git(["branch", "side"])
+
+        let client = GitClient(workingDirectory: repo.root.path)
+        try await client.createBranch("feature", from: "side")
+        let feature = try #require(try await client.branches().first { $0.name == "feature" })
+        let side = try #require(try await client.branches().first { $0.name == "side" })
+        #expect(feature.oid == side.oid)
+        #expect(!feature.isCurrent)
+        #expect(try await client.head().name == "main")
+        await #expect(throws: GitFailure.self) {
+            try await client.createBranch("   ", from: "side")
+        }
+        await #expect(throws: GitFailure.self) {
+            try await client.createBranch("feature", from: "side")
+        }
+    }
+
+    @Test func mergeBringsAnotherBranchIntoTheCurrentOne() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "first"])
+        try repo.git(["branch", "side"])
+        try repo.git(["checkout", "side"])
+        try "side\n".write(to: repo.root.appendingPathComponent("side.txt"), atomically: true, encoding: .utf8)
+        try repo.git(["add", "side.txt"])
+        try repo.git(["commit", "-m", "from-side"])
+        try repo.git(["checkout", "main"])
+        try "main\n".write(to: repo.root.appendingPathComponent("main.txt"), atomically: true, encoding: .utf8)
+        try repo.git(["add", "main.txt"])
+        try repo.git(["commit", "-m", "from-main"])
+
+        let client = GitClient(workingDirectory: repo.root.path)
+        await #expect(throws: GitFailure.self) {
+            try await client.merge("side", into: "side")
+        }
+        try await client.merge("side", into: "main")
+        let tip = try await client.log(skip: 0, limit: 1)
+        #expect(tip.commits.first?.parents.count == 2)
+        #expect(FileManager.default.fileExists(atPath: repo.root.appendingPathComponent("side.txt").path))
+        #expect(FileManager.default.fileExists(atPath: repo.root.appendingPathComponent("main.txt").path))
+        #expect(try await client.head().name == "main")
     }
 
     @Test func amendAddsStagedChangesAndKeepsTheEditedMessage() async throws {
@@ -1055,6 +1352,112 @@ struct GitClientTests {
         #expect(tip.commits.first?.subject == "second amended")
         try repo.git(["fetch", "origin"])
         #expect(try await client.pushDivergence(branch: "main", upstream: "origin/main") == .upToDate)
+    }
+
+    @Test func fastForwardUpdatesABranchThatIsBehind() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "first"])
+
+        let remote = FileManager.default.temporaryDirectory.appendingPathComponent("gitsprout-remote-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: remote) }
+        try repo.git(["init", "--bare", remote.path])
+        try repo.git(["remote", "add", "origin", remote.path])
+        try repo.git(["push", "-u", "origin", "main"])
+        try repo.git(["branch", "side"])
+        try repo.git(["branch", "--set-upstream-to=origin/main", "side"])
+
+        let other = try TemporaryRepo()
+        try other.git(["remote", "add", "origin", remote.path])
+        try other.git(["fetch", "origin"])
+        try other.git(["checkout", "-B", "main", "origin/main"])
+        try "remote\n".write(to: other.root.appendingPathComponent("remote.txt"), atomically: true, encoding: .utf8)
+        try other.git(["add", "remote.txt"])
+        try other.git(["commit", "-m", "from-remote"])
+        try other.git(["push", "origin", "main"])
+
+        let client = GitClient(workingDirectory: repo.root.path)
+        try repo.git(["fetch", "origin"])
+        let behind = try #require(try await client.branches().first { $0.name == "main" })
+        let side = try #require(try await client.branches().first { $0.name == "side" })
+        #expect(behind.sync == .behind(1))
+        #expect(side.sync == .behind(1))
+
+        try await client.fastForward(branch: "side", upstream: "origin/main", remote: "origin", isCurrent: false)
+        let forwarded = try #require(try await client.branches().first { $0.name == "side" })
+        let current = try #require(try await client.branches().first { $0.name == "main" })
+        #expect(forwarded.sync == .upToDate)
+        #expect(current.sync == .behind(1))
+        #expect(try await client.head().name == "main")
+
+        try await client.fastForward(branch: "main", upstream: "origin/main", remote: "origin", isCurrent: true)
+        let synced = try #require(try await client.branches().first { $0.name == "main" })
+        #expect(synced.sync == .upToDate)
+        let tip = try await client.log(skip: 0, limit: 1)
+        #expect(tip.commits.first?.subject == "from-remote")
+    }
+
+    @Test func untrackedMainIsAheadOfTheRemoteBranchWithTheSameName() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "first"])
+
+        let remote = FileManager.default.temporaryDirectory.appendingPathComponent("gitsprout-remote-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: remote) }
+        try repo.git(["init", "--bare", remote.path])
+        try repo.git(["remote", "add", "origin", remote.path])
+        try repo.git(["push", "-u", "origin", "main"])
+        try repo.git(["branch", "--unset-upstream"])
+
+        try "two\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "second"])
+
+        let client = GitClient(workingDirectory: repo.root.path)
+        let main = try #require(try await client.branches().first { $0.name == "main" })
+        #expect(main.upstream == "origin/main")
+        #expect(main.remoteName == "origin")
+        #expect(main.sync == .ahead(1))
+    }
+
+    @Test func missingBranchesShowPushOrPull() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("hello.txt")
+        try "one\n".write(to: file, atomically: true, encoding: .utf8)
+        try repo.git(["add", "hello.txt"])
+        try repo.git(["commit", "-m", "first"])
+
+        let remote = FileManager.default.temporaryDirectory.appendingPathComponent("gitsprout-remote-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: remote) }
+        try repo.git(["init", "--bare", remote.path])
+        try repo.git(["remote", "add", "origin", remote.path])
+        try repo.git(["push", "-u", "origin", "main"])
+        try repo.git(["branch", "only-local"])
+
+        let other = try TemporaryRepo()
+        try other.git(["remote", "add", "origin", remote.path])
+        try other.git(["fetch", "origin"])
+        try other.git(["checkout", "-B", "main", "origin/main"])
+        try other.git(["branch", "only-remote"])
+        try other.git(["push", "origin", "only-remote"])
+        try repo.git(["fetch", "origin"])
+
+        let client = GitClient(workingDirectory: repo.root.path)
+        let branches = try await client.branches()
+        #expect(branches.first { $0.name == "main" }?.sync == .upToDate)
+        #expect(branches.first { $0.name == "only-local" }?.sync == .notOnRemote)
+        let remoteOnly = try #require(branches.first { $0.name == "only-remote" })
+        #expect(remoteOnly.sync == .remoteOnly)
+        #expect(remoteOnly.upstream == "origin/only-remote")
+
+        try await client.trackRemoteBranch("only-remote", upstream: "origin/only-remote", checkout: false)
+        let pulled = try #require(try await client.branches().first { $0.name == "only-remote" })
+        #expect(pulled.sync == .upToDate)
+        #expect(try await client.head().name == "main")
     }
 
     @Test func remoteLinkPrefersTheBranchRemoteThenOrigin() async throws {
@@ -1186,6 +1589,70 @@ struct GitClientTests {
         let diff = try await client.diff(path: "notes.pdf", staged: false)
         #expect(diff.beforeImage == .data(first))
         #expect(diff.afterImage == .data(second))
+    }
+}
+
+struct MissingNewlineFixTests {
+    @Test func indexParserKeepsARegularStageZeroBlob() {
+        let staged = Data("100644 abcdef 0\tnote.txt\0".utf8)
+        #expect(IndexStageParser.regularBlob(staged)?.mode == "100644")
+        #expect(IndexStageParser.regularBlob(staged)?.hash == "abcdef")
+        #expect(IndexStageParser.regularBlob(Data("120000 abcdef 0\tlink\0".utf8)) == nil)
+        #expect(IndexStageParser.regularBlob(Data("100644 abcdef 1\ta\0".utf8)) == nil)
+        let later = Data("100644 abcdef 1\ta\0100755 fedcba 0\tb\0".utf8)
+        #expect(IndexStageParser.regularBlob(later)?.mode == "100755")
+        #expect(IndexStageParser.regularBlob(later)?.hash == "fedcba")
+    }
+
+    @Test func appendingANewlineClearsTheWorktreeMarker() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("note.txt")
+        try Data("hello\n".utf8).write(to: file)
+        try repo.git(["add", "note.txt"])
+        try repo.git(["commit", "-m", "add"])
+        try Data("hello".utf8).write(to: file)
+        let client = GitClient(workingDirectory: repo.root.path)
+        let before = try await client.diff(path: "note.txt", staged: false)
+        #expect(before.hunks.flatMap(\.lines).contains { $0.text == MissingNewlineNote.rawLine })
+        try await client.appendTrailingNewline(path: "note.txt", staged: false)
+        #expect(try Data(contentsOf: file) == Data("hello\n".utf8))
+        let after = try await client.diff(path: "note.txt", staged: false)
+        #expect(after.isEmpty)
+    }
+
+    @Test func appendingANewlineOnAStagedDiffKeepsOtherWorktreeEdits() async throws {
+        let repo = try TemporaryRepo()
+        let file = repo.root.appendingPathComponent("note.txt")
+        try Data("hello\n".utf8).write(to: file)
+        try repo.git(["add", "note.txt"])
+        try repo.git(["commit", "-m", "add"])
+        try Data("hello".utf8).write(to: file)
+        try repo.git(["add", "note.txt"])
+        try Data("hello world".utf8).write(to: file)
+        let client = GitClient(workingDirectory: repo.root.path)
+        try await client.appendTrailingNewline(path: "note.txt", staged: true)
+        #expect(try Data(contentsOf: file) == Data("hello world\n".utf8))
+        let staged = try await client.diff(path: "note.txt", staged: true)
+        #expect(staged.isEmpty)
+        let unstaged = try await client.diff(path: "note.txt", staged: false)
+        let markers = unstaged.hunks.flatMap(\.lines).filter { $0.text == MissingNewlineNote.rawLine }
+        #expect(markers.isEmpty)
+        #expect(unstaged.hunks.flatMap(\.lines).contains { $0.text == "hello world" })
+    }
+
+    @Test func appendingANewlineRefusesASymlink() async throws {
+        let repo = try TemporaryRepo()
+        let target = repo.root.appendingPathComponent("target.txt")
+        try Data("target".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(
+            at: repo.root.appendingPathComponent("link.txt"),
+            withDestinationURL: target
+        )
+        let client = GitClient(workingDirectory: repo.root.path)
+        await #expect(throws: GitFailure.self) {
+            try await client.appendTrailingNewline(path: "link.txt", staged: false)
+        }
+        #expect(try Data(contentsOf: target) == Data("target".utf8))
     }
 }
 

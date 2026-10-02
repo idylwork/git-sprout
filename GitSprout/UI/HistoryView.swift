@@ -51,7 +51,7 @@ struct HistoryView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .keyboardTarget(.commits, focusable: true)
-                    .selectionArrows(target: .commits) { delta in
+                    .selectionArrows(target: .commits) { delta, _ in
                         moveCommit(delta)
                     }
                     .onAppear { scrollToFocus(proxy) }
@@ -89,6 +89,39 @@ struct HistoryView: View {
     }
 }
 
+/// 件名の下に本文を出す。短いときは高さに沿い、長いときはこの中だけスクロールする。
+private struct CommitMessageBody: View {
+    var text: String
+    private let maxHeight: CGFloat = 160
+    @State private var contentHeight: CGFloat = 0
+
+    var body: some View {
+        ScrollView {
+            Text(text)
+                .font(.callout)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: CommitBodyHeightKey.self, value: proxy.size.height)
+                    }
+                }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(height: min(max(contentHeight, 1), maxHeight))
+        .onPreferenceChange(CommitBodyHeightKey.self) { contentHeight = $0 }
+    }
+}
+
+private struct CommitBodyHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct SelectableText: View {
     var text: String
     var monospaced = false
@@ -100,6 +133,18 @@ private struct SelectableText: View {
             .lineLimit(monospaced ? 2 : 3)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
+}
+
+private enum HistoryMetrics {
+    static let rowHeight: CGFloat = 28
+
+    static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
 }
 
 private struct HistoryRow: View {
@@ -118,35 +163,36 @@ private struct HistoryRow: View {
     var body: some View {
         HStack(spacing: 8) {
             GraphGlyphs(row: row, muted: isUncommitted)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(subjectText)
-                    .foregroundStyle(isUncommitted ? Color.secondary : Color.primary)
-                    .lineLimit(1)
-                if let caption {
-                    Text(caption)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                } else if !isUncommitted {
-                    HStack(spacing: 8) {
-                        if !row.commit.decoration.isEmpty {
-                            Text(row.commit.decoration)
-                                .foregroundStyle(Color.accentColor)
-                        }
-                        Text(row.commit.authorName)
-                        Text(row.commit.authoredAt.formatted(date: .abbreviated, time: .shortened))
-                        Text(String(row.commit.oid.prefix(7)))
-                    }
+            Text(subjectText)
+                .foregroundStyle(isUncommitted ? Color.secondary : Color.primary)
+                .lineLimit(1)
+                .layoutPriority(1)
+            if let caption {
+                Text(caption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            } else if !isUncommitted {
+                if !row.commit.decoration.isEmpty {
+                    Text(row.commit.decoration)
+                        .font(.caption)
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
                 }
+                Spacer(minLength: 8)
+                Text(HistoryMetrics.dateFormatter.string(from: row.commit.authoredAt))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
-            Spacer(minLength: 0)
+            if isUncommitted {
+                Spacer(minLength: 0)
+            }
         }
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 40)
+        .frame(height: HistoryMetrics.rowHeight)
         .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
     }
 }
@@ -155,7 +201,7 @@ private struct GraphGlyphs: View {
     var row: GraphRow
     var muted = false
     private let laneWidth: CGFloat = 14
-    private let rowHeight: CGFloat = 40
+    private let rowHeight: CGFloat = HistoryMetrics.rowHeight
 
     var body: some View {
         Canvas { context, size in
@@ -176,7 +222,7 @@ private struct GraphGlyphs: View {
                 let startY: CGFloat = edge.fromLane == row.commitLane ? midY : 0
                 path.move(to: CGPoint(x: startX, y: startY))
                 if edge.joinsCommit {
-                    // 前のコミットの丸から伸びてきた色を、この丸まで保って合流する。
+                    // 前のコミットの丸から伸びてきた色を、この丸まで保って合流する
                     let drop = min(max(abs(endX - startX) * 0.75, 8), 12)
                     let bendStart = max(startY, midY - drop)
                     if bendStart > startY + 0.5 {
@@ -250,7 +296,9 @@ struct HistoryDetailView: View {
                     },
                     onOpenHistory: { path in
                         Task { await session.openFileHistory(path) }
-                    }
+                    },
+                    sectionTitle: String(localized: "Committed Files"),
+                    menu: commitFileMenu
                 ) {
                     commitFilesHeader
                 }
@@ -273,44 +321,72 @@ struct HistoryDetailView: View {
         }
     }
 
+    private var commitFileMenu: [SectionMenuItem] {
+        guard let commit = session.selectedCommitRecord else { return [] }
+        let isCheckedOut = !session.head.oid.isEmpty && commit.oid == session.head.oid
+        var menu = [
+            SectionMenuItem(
+                id: "checkout",
+                title: String(localized: "Checkout"),
+                action: { session.confirmDetach(commit.oid) }
+            ),
+            SectionMenuItem(
+                id: "diff",
+                title: String(localized: "View Diff from Here"),
+                disabled: session.head.oid.isEmpty || isCheckedOut,
+                action: { Task { await session.showRangeDiff() } }
+            )
+        ]
+        if isCheckedOut {
+            menu.append(
+                SectionMenuItem(
+                    id: "undo",
+                    title: String(localized: "Undo Commit"),
+                    destructive: true,
+                    disabled: commit.parents.isEmpty,
+                    dividerBefore: true,
+                    action: { session.confirmUndoCommit() }
+                )
+            )
+        }
+        return menu
+    }
+
     private var commitFilesHeader: some View {
-        HStack(alignment: .top, spacing: 8) {
+        VStack(alignment: .leading, spacing: 4) {
             if let commit = session.selectedCommitRecord {
-                commitDetails(commit)
-            }
-            Spacer(minLength: 8)
-            if let oid = session.selectedCommit {
-                Button("View Diff") {
-                    Task { await session.showRangeDiff() }
-                }
-                .disabled(session.head.oid.isEmpty || oid == session.head.oid)
-                Button("Checkout") {
-                    session.confirmDetach(oid)
-                }
+                commitMessage(commit)
+                commitMetadata(commit)
             }
         }
         .padding(10)
     }
 
-    private func commitDetails(_ commit: CommitRecord) -> some View {
+    private func commitMessage(_ commit: CommitRecord) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(commit.subject.isEmpty ? String(localized: "(No message)") : commit.subject)
                 .font(.headline)
                 .textSelection(.enabled)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 3) {
-                detailRow("Commit ID", commit.oid, monospaced: true)
-                detailRow("Date", commit.authoredAt.formatted(date: .abbreviated, time: .shortened))
-                if !commit.authorName.isEmpty {
-                    detailRow("Author", commit.authorName)
-                }
-                if !commit.decoration.isEmpty {
-                    detailRow("Refs", commit.decoration)
-                }
+            if !commit.body.isEmpty {
+                CommitMessageBody(text: commit.body)
             }
-            .font(.caption)
         }
+    }
+
+    private func commitMetadata(_ commit: CommitRecord) -> some View {
+        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 3) {
+            detailRow("Commit ID", commit.oid, monospaced: true)
+            detailRow("Date", commit.authoredAt.formatted(date: .abbreviated, time: .shortened))
+            if !commit.authorName.isEmpty {
+                detailRow("Author", commit.authorName)
+            }
+            if !commit.decoration.isEmpty {
+                detailRow("Refs", commit.decoration)
+            }
+        }
+        .font(.caption)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 

@@ -14,10 +14,11 @@ nonisolated enum PendingConfirm: Identifiable, Sendable {
     case dropStash(String)
     case detach(String)
     case deleteBranch(String)
+    case mergeBranch(source: String, into: String)
     case rebaseBranch(name: String, upstream: String, remote: String?)
-    case matchRemote(name: String, upstream: String, remote: String, isCurrent: Bool)
     case pull(name: String, upstream: String, remote: String, isCurrent: Bool)
     case forcePush(branch: String, remote: String, upstream: String)
+    case undoCommit
 
     var id: String {
         switch self {
@@ -28,10 +29,11 @@ nonisolated enum PendingConfirm: Identifiable, Sendable {
         case .dropStash(let ref): return "stash-\(ref)"
         case .detach(let oid): return "detach-\(oid)"
         case .deleteBranch(let name): return "delete-branch-\(name)"
+        case .mergeBranch(let source, let target): return "merge-\(source)-\(target)"
         case .rebaseBranch(let name, let upstream, _): return "rebase-\(name)-\(upstream)"
-        case .matchRemote(let name, let upstream, _, _): return "match-\(name)-\(upstream)"
         case .pull(let name, let upstream, _, _): return "pull-\(name)-\(upstream)"
         case .forcePush(let branch, let remote, _): return "force-push-\(branch)-\(remote)"
+        case .undoCommit: return "undo-commit"
         }
     }
 
@@ -45,14 +47,16 @@ nonisolated enum PendingConfirm: Identifiable, Sendable {
             return String(localized: "Check Out This Commit?")
         case .deleteBranch:
             return String(localized: "Delete Branch?")
+        case .mergeBranch:
+            return String(localized: "Merge Branch?")
         case .rebaseBranch:
             return String(localized: "Rebase Branch?")
-        case .matchRemote:
-            return String(localized: "Match the Remote?")
         case .pull:
-            return String(localized: "Pull Branch?")
+            return String(localized: "Force Pull Branch?")
         case .forcePush:
             return String(localized: "Overwrite the Remote?")
+        case .undoCommit:
+            return String(localized: "Undo This Commit?")
         }
     }
 
@@ -70,16 +74,19 @@ nonisolated enum PendingConfirm: Identifiable, Sendable {
             return String(localized: "This leaves the current branch and checks out the commit directly.")
         case .deleteBranch(let name):
             return String(localized: "Commits on \(name) that are not on another branch will be lost.")
+        case .mergeBranch(let source, let target):
+            return String(localized: "This merges \(source) into \(target).")
         case .rebaseBranch(let name, let upstream, _):
             return String(localized: "Rebase \(name) onto \(upstream).")
-        case .matchRemote(let name, let upstream, _, let isCurrent),
-             .pull(let name, let upstream, _, let isCurrent):
+        case .pull(let name, let upstream, _, let isCurrent):
             if isCurrent {
-                return String(localized: "Move \(name) to \(upstream). Commits that are only on this branch, and uncommitted changes, will be lost.")
+                return String(localized: "Commits on \(name) and \(upstream) don't match. Force pulling discards commits that are only on this branch, and uncommitted changes.")
             }
-            return String(localized: "Move \(name) to \(upstream). Commits that are only on this branch will be lost.")
+            return String(localized: "Commits on \(name) and \(upstream) don't match. Force pulling discards commits that are only on this branch.")
         case .forcePush(_, _, let upstream):
-            return String(localized: "This branch and \(upstream) have diverged. Pushing replaces the remote branch with this one.")
+            return String(localized: "Commits on \(upstream) don't match. Force pushing discards the remote branch's changes.")
+        case .undoCommit:
+            return String(localized: "HEAD moves to the parent commit. The changes stay staged.")
         }
     }
 
@@ -93,20 +100,22 @@ nonisolated enum PendingConfirm: Identifiable, Sendable {
             return String(localized: "Checkout")
         case .deleteBranch:
             return String(localized: "Delete")
+        case .mergeBranch:
+            return String(localized: "Merge")
         case .rebaseBranch:
             return String(localized: "Rebase")
-        case .matchRemote:
-            return String(localized: "Match Remote")
         case .pull:
-            return String(localized: "Pull")
+            return String(localized: "Force Pull")
         case .forcePush:
-            return String(localized: "Push")
+            return String(localized: "Force Push")
+        case .undoCommit:
+            return String(localized: "Undo Commit")
         }
     }
 
     var isDestructive: Bool {
         switch self {
-        case .rebaseBranch:
+        case .mergeBranch, .rebaseBranch:
             return false
         default:
             return true
@@ -231,6 +240,7 @@ final class WorkspaceSession {
     private var loadedHistoryCount = 0
     private var loadedFileHistoryCount = 0
     private var historyTicket = 0
+    private var branchesTicket = 0
     private var fileHistoryTicket = 0
     private var diffTicket = 0
     private var searchTicket = 0
@@ -307,7 +317,7 @@ final class WorkspaceSession {
                     return
                 }
             } catch {
-                // 判定できないときは status を読んで取りこぼさない。
+                // 判定できないときは status を読んで取りこぼさない
             }
         }
         await refreshStatus()
@@ -330,7 +340,7 @@ final class WorkspaceSession {
     func refreshStatus() async {
         await track {
             do {
-                let snapshot = try await client.status()
+                let snapshot = try await client.status(listEachUntrackedFile: AppSettings.listEachUntrackedFile)
                 changes = snapshot.files
                 statusTruncated = snapshot.truncated
                 if changeCount == 0, selectedCommit == CommitRecord.uncommittedOID {
@@ -473,6 +483,12 @@ final class WorkspaceSession {
         }
     }
 
+    func appendTrailingNewline(path: String, staged: Bool) async {
+        await mutate {
+            try await client.appendTrailingNewline(path: path, staged: staged)
+        }
+    }
+
     func stageCommitLines(_ patch: String) async {
         await mutate {
             try await client.apply(patch: patch, cached: true, reverse: false)
@@ -496,6 +512,7 @@ final class WorkspaceSession {
             historyDirty = true
             await refreshHead()
             await refreshStatus()
+            await refreshBranches()
             if section == .commits {
                 await reloadHistory()
             }
@@ -701,13 +718,19 @@ final class WorkspaceSession {
     }
 
     func refreshBranches() async {
+        branchesTicket += 1
+        let ticket = branchesTicket
         branchesLoading = true
-        defer { branchesLoading = false }
+        defer { if ticket == branchesTicket { branchesLoading = false } }
         do {
-            branches = try await client.branches()
+            let listed = try await client.branches()
+            guard ticket == branchesTicket else { return }
+            branches = listed
         } catch {
+            guard ticket == branchesTicket else { return }
             report(error)
         }
+        guard ticket == branchesTicket else { return }
         await refreshRemoteLink()
     }
 
@@ -750,10 +773,77 @@ final class WorkspaceSession {
         await send(branch: branch.name, remote: remote, forceWithLease: false, setUpstream: branch.remoteName == nil)
     }
 
+    /// 上流を取得して早送りする。履歴が分かれているときは、確認のあと強制的に上流へ合わせる。
+    func pull(_ branch: Branch) async {
+        guard !isMutating else { return }
+        if branch.sync == .remoteOnly {
+            guard let upstream = branch.upstream else { return }
+            await mutate {
+                try await client.trackRemoteBranch(branch.name, upstream: upstream, checkout: false)
+                await refreshBranches()
+            }
+            return
+        }
+        guard let upstream = branch.upstream, let remote = branch.remoteName else { return }
+        let divergence: PushDivergence
+        isMutating = true
+        do {
+            divergence = try await client.pullDivergence(branch: branch.name, upstream: upstream, remote: remote)
+        } catch {
+            isMutating = false
+            report(error)
+            return
+        }
+        isMutating = false
+        await refreshBranches()
+        switch divergence {
+        case .diverged:
+            pendingConfirm = .pull(
+                name: branch.name,
+                upstream: upstream,
+                remote: remote,
+                isCurrent: branch.isCurrent
+            )
+        case .behind:
+            await mutate {
+                try await client.fastForward(
+                    branch: branch.name,
+                    upstream: upstream,
+                    remote: remote,
+                    isCurrent: branch.isCurrent,
+                    fetches: false
+                )
+                await refreshBranches()
+                if branch.isCurrent, section == .commits {
+                    await reloadHistory()
+                }
+            }
+        case .upToDate, .fastForward:
+            break
+        }
+    }
+
     func switchBranch(_ name: String) async {
         await mutate {
             try await client.switchBranch(name)
             await reloadAfterCheckout()
+        }
+    }
+
+    func checkoutRemote(_ branch: Branch) async {
+        guard let upstream = branch.upstream else { return }
+        await mutate {
+            try await client.trackRemoteBranch(branch.name, upstream: upstream, checkout: true)
+            await reloadAfterCheckout()
+        }
+    }
+
+    func createBranch(from startPoint: String, named newName: String) async {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        await mutate {
+            try await client.createBranch(trimmed, from: startPoint)
+            await refreshBranches()
         }
     }
 
@@ -768,6 +858,10 @@ final class WorkspaceSession {
 
     func confirmDetach(_ oid: String) {
         pendingConfirm = .detach(oid)
+    }
+
+    func confirmUndoCommit() {
+        pendingConfirm = .undoCommit
     }
 
     func refreshStashes() async {
@@ -832,12 +926,13 @@ final class WorkspaceSession {
         stashDiffLoading = false
     }
 
-    func createStash(message custom: String? = nil) async {
+    func createStash(message custom: String? = nil, unstagedOnly: Bool = false) async {
         let message = (custom ?? stashMessage).trimmingCharacters(in: .whitespacesAndNewlines)
         await mutate {
             try await client.stashPush(
                 message: message.isEmpty ? nil : message,
-                includeUntracked: AppSettings.stashIncludeUntracked
+                includeUntracked: AppSettings.stashIncludeUntracked,
+                unstagedOnly: unstagedOnly
             )
             if custom == nil {
                 stashMessage = ""
@@ -1036,13 +1131,17 @@ final class WorkspaceSession {
                 try await client.deleteBranch(name)
                 await refreshBranches()
             }
+        case .mergeBranch(let source, let target):
+            await mutate {
+                try await client.merge(source, into: target)
+                await reloadAfterCheckout()
+            }
         case .rebaseBranch(let name, let upstream, let remote):
             await mutate {
                 try await client.rebase(branch: name, onto: upstream, remote: remote)
                 await reloadAfterCheckout()
             }
-        case .matchRemote(let name, let upstream, let remote, let isCurrent),
-             .pull(let name, let upstream, let remote, let isCurrent):
+        case .pull(let name, let upstream, let remote, let isCurrent):
             await mutate {
                 try await client.matchRemote(branch: name, upstream: upstream, remote: remote, isCurrent: isCurrent)
                 if isCurrent {
@@ -1053,6 +1152,15 @@ final class WorkspaceSession {
             }
         case .forcePush(let branch, let remote, _):
             await send(branch: branch, remote: remote, forceWithLease: true, setUpstream: false)
+        case .undoCommit:
+            let previous = head.oid
+            await mutate {
+                try await client.undoHeadCommit()
+                await reloadAfterCheckout()
+            }
+            guard head.oid != previous, !head.oid.isEmpty else { return }
+            revealHistory(head.oid)
+            await selectCommit(head.oid)
         }
     }
 

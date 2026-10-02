@@ -114,6 +114,8 @@ nonisolated struct CommitRecord: Identifiable, Sendable, Equatable {
     var authoredAt: Date
     var decoration: String
     var subject: String
+    /// 空行のあとの本文。履歴の詳細に出す。
+    var body: String
 
     var id: String { oid }
 
@@ -126,7 +128,8 @@ nonisolated struct CommitRecord: Identifiable, Sendable, Equatable {
         authorEmail: String = "",
         authoredAt: Date = .distantPast,
         decoration: String = "",
-        subject: String = ""
+        subject: String = "",
+        body: String = ""
     ) {
         self.oid = oid
         self.parents = parents
@@ -135,6 +138,25 @@ nonisolated struct CommitRecord: Identifiable, Sendable, Equatable {
         self.authoredAt = authoredAt
         self.decoration = decoration
         self.subject = subject
+        self.body = body
+    }
+}
+
+/// 件名と本文のあいだに空行を置く。2行目に本文があると Git は段落全体を件名に畳む。
+nonisolated enum CommitMessageText {
+    static func insertingBlankSecondLine(_ message: String) -> String {
+        let normalized = message
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard lines.count >= 2 else { return normalized }
+        if lines[1].trimmingCharacters(in: .whitespaces).isEmpty {
+            guard !lines[1].isEmpty else { return normalized }
+            lines[1] = ""
+            return lines.joined(separator: "\n")
+        }
+        lines.insert("", at: 1)
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -151,7 +173,33 @@ nonisolated struct Branch: Identifiable, Sendable, Equatable {
     var upstream: String? = nil
     /// 上流のリモート名。ローカルブランチを追跡しているときは nil。
     var remoteName: String? = nil
+    /// 取得済みの上流との差。追跡していない、または比較できないときは `.unknown`。
+    var sync: BranchSync = .unknown
+    /// 最新コミットの件名。
+    var subject: String = ""
+    /// 最新コミットのコミット日時。
+    var committedAt: Date? = nil
     var id: String { name }
+
+    /// 件名の1行目。空なら nil。
+    var subjectLine: String? {
+        let line = subject.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// ローカルブランチと、最後に取得した上流の関係。
+nonisolated enum BranchSync: Sendable, Equatable {
+    case unknown
+    case upToDate
+    case ahead(Int)
+    case behind(Int)
+    case diverged(ahead: Int, behind: Int)
+    /// 同名のリモートブランチがない。
+    case notOnRemote
+    /// リモートにしかない。
+    case remoteOnly
 }
 
 /// 表示に使うリモート。ブラウザで開けないパスのときは `browserURL` が nil。
@@ -264,6 +312,21 @@ nonisolated struct DiffLine: Identifiable, Sendable, Equatable {
         case .meta: return ""
         }
     }
+}
+
+/// `git diff` の `\ No newline at end of file`。直前の行が削除なら、新しい側では改行が足されている。
+nonisolated enum MissingNewlineNote: Sendable, Equatable {
+    case resolved
+    case missing
+
+    static let rawLine = "\\ No newline at end of file"
+
+    static func state(of line: DiffLine, previous: DiffLine.Kind?) -> MissingNewlineNote? {
+        guard line.kind == .meta, line.text == rawLine else { return nil }
+        return previous == .deletion ? .resolved : .missing
+    }
+
+    static let title = "No newline at end of file"
 }
 
 nonisolated struct DiffHunk: Identifiable, Sendable, Equatable {
