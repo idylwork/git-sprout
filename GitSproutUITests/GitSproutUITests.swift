@@ -1,10 +1,3 @@
-//
-//  GitSproutUITests.swift
-//  GitSproutUITests
-//
-//  Created by Kaol Yoshinaga on 2026/09/29.
-//
-
 import XCTest
 
 final class GitSproutUITests: XCTestCase {

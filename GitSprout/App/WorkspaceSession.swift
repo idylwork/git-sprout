@@ -1,12 +1,7 @@
-//
-//  WorkspaceSession.swift
-//  GitSprout
-//
-
 import Foundation
 import Observation
 
-nonisolated enum PendingConfirm: Identifiable, Sendable {
+nonisolated enum ConfirmationRequest: Identifiable, Sendable {
     case discardUnstaged(FileChange)
     case discardAllUnstaged
     case discardStaged(FileChange)
@@ -123,7 +118,7 @@ nonisolated enum PendingConfirm: Identifiable, Sendable {
     }
 }
 
-struct HistoryFocus: Equatable {
+struct HistoryScrollRequest: Equatable {
     var oid: String
     var token: Int
 }
@@ -136,10 +131,10 @@ final class WorkspaceSession {
     let client: GitClient
     let rootPath: String
 
-    var section: SidebarSection = .commits
+    var section: SidebarPage = .commits
     var head = HeadState.unknown
     var errorMessage: String?
-    var pendingConfirm: PendingConfirm?
+    var pendingConfirm: ConfirmationRequest?
     var terminalVisible = false
     var didActivateOnce = false
     private(set) var loadCount = 0
@@ -168,7 +163,7 @@ final class WorkspaceSession {
     var rangePath: String?
     var rangeDiff: DiffDocument?
     var rangeDiffLoading = false
-    var historyFocus: HistoryFocus?
+    var historyFocus: HistoryScrollRequest?
     var commitFiles: [PathStatus] = []
     var commitFilesCapped = false
     var commitFilesLoading = false
@@ -220,12 +215,12 @@ final class WorkspaceSession {
     var fileHistoryLoading = false
     var fileHistoryLoadingMore = false
     var selectedFileRevision: String?
-    var fileBodyMode: FileBodyMode = .content
+    var fileBodyMode: FileHistoryDisplayMode = .content
     var fileBlob: FileBlob?
     var fileParentDiff: DiffDocument?
     var fileBodyLoading = false
 
-    var searchKind: SearchKind = .message
+    var searchKind: SearchScope = .message
     var searchQuery = ""
     var commitHits: [CommitRecord] = []
     var pathHits: [String] = []
@@ -531,7 +526,7 @@ final class WorkspaceSession {
         do {
             let page = try await client.log(skip: 0, limit: GitLimits.pageSize)
             let headOID = head.oid
-            let laid = await OffMain.run { GraphLayout.layout(commits: page.commits, cursor: .empty, head: headOID) }
+            let laid = await BackgroundWork.run { GraphLayout.layout(commits: page.commits, cursor: .empty, head: headOID) }
             guard ticket == historyTicket else { return }
             graphRows = laid.rows
             graphCursor = laid.cursor
@@ -554,7 +549,7 @@ final class WorkspaceSession {
         let headOID = head.oid
         do {
             let page = try await client.log(skip: skip, limit: GitLimits.pageSize)
-            let laid = await OffMain.run { GraphLayout.layout(commits: page.commits, cursor: cursor, head: headOID) }
+            let laid = await BackgroundWork.run { GraphLayout.layout(commits: page.commits, cursor: cursor, head: headOID) }
             guard ticket == historyTicket else { return }
             graphRows.append(contentsOf: laid.rows)
             graphCursor = laid.cursor
@@ -593,7 +588,7 @@ final class WorkspaceSession {
 
     func revealHistory(_ oid: String) {
         focusToken += 1
-        historyFocus = HistoryFocus(oid: oid, token: focusToken)
+        historyFocus = HistoryScrollRequest(oid: oid, token: focusToken)
     }
 
     func selectCommit(_ oid: String) async {
@@ -752,7 +747,7 @@ final class WorkspaceSession {
             return
         }
         if let upstream = branch.upstream, branch.remoteName != nil {
-            let divergence: PushDivergence
+            let divergence: UpstreamRelation
             do {
                 divergence = try await client.pushDivergence(branch: branch.name, upstream: upstream)
             } catch {
@@ -785,7 +780,7 @@ final class WorkspaceSession {
             return
         }
         guard let upstream = branch.upstream, let remote = branch.remoteName else { return }
-        let divergence: PushDivergence
+        let divergence: UpstreamRelation
         isMutating = true
         do {
             divergence = try await client.pullDivergence(branch: branch.name, upstream: upstream, remote: remote)
@@ -1103,7 +1098,7 @@ final class WorkspaceSession {
         }
     }
 
-    func perform(_ confirm: PendingConfirm) async {
+    func perform(_ confirm: ConfirmationRequest) async {
         pendingConfirm = nil
         switch confirm {
         case .discardUnstaged(let file):

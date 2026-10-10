@@ -1,48 +1,43 @@
-//
-//  GitSproutTests.swift
-//  GitSproutTests
-//
-
 import AppKit
 import Foundation
 import PDFKit
 import Testing
 @testable import GitSprout
 
-struct SelectionStepTests {
+struct ListSelectionMoverTests {
     @Test func movesWithinTheListAndClampsAtTheEnds() {
         let items = ["a", "b", "c"]
-        #expect(SelectionStep.index(of: "b", in: items, delta: 1) == 2)
-        #expect(SelectionStep.index(of: "b", in: items, delta: -1) == 0)
-        #expect(SelectionStep.index(of: "a", in: items, delta: -1) == 0)
-        #expect(SelectionStep.index(of: "c", in: items, delta: 1) == 2)
-        #expect(SelectionStep.index(of: nil, in: items, delta: 1) == 0)
-        #expect(SelectionStep.index(of: nil, in: items, delta: -1) == 2)
-        #expect(SelectionStep.index(of: "missing", in: items, delta: 1) == 0)
-        #expect(SelectionStep.index(of: "a", in: [String](), delta: 1) == nil)
-        #expect(SelectionStep.index(of: "a", in: items, delta: 0) == nil)
+        #expect(ListSelectionMover.index(of: "b", in: items, delta: 1) == 2)
+        #expect(ListSelectionMover.index(of: "b", in: items, delta: -1) == 0)
+        #expect(ListSelectionMover.index(of: "a", in: items, delta: -1) == 0)
+        #expect(ListSelectionMover.index(of: "c", in: items, delta: 1) == 2)
+        #expect(ListSelectionMover.index(of: nil, in: items, delta: 1) == 0)
+        #expect(ListSelectionMover.index(of: nil, in: items, delta: -1) == 2)
+        #expect(ListSelectionMover.index(of: "missing", in: items, delta: 1) == 0)
+        #expect(ListSelectionMover.index(of: "a", in: [String](), delta: 1) == nil)
+        #expect(ListSelectionMover.index(of: "a", in: items, delta: 0) == nil)
     }
 
     @Test func shiftExtendsFromTheAnchorAndPlainArrowCollapsesToTheLead() {
         let items = ["a", "b", "c", "d"]
         var cursor = SelectionCursor(selection: ["b"], anchor: "b", lead: "b")
-        cursor = SelectionStep.move(cursor, in: items, delta: 1, extending: true)
+        cursor = ListSelectionMover.move(cursor, in: items, delta: 1, extending: true)
         #expect(cursor.selection == ["b", "c"])
         #expect(cursor.anchor == "b")
         #expect(cursor.lead == "c")
-        cursor = SelectionStep.move(cursor, in: items, delta: 1, extending: true)
+        cursor = ListSelectionMover.move(cursor, in: items, delta: 1, extending: true)
         #expect(cursor.selection == ["b", "c", "d"])
         #expect(cursor.lead == "d")
-        cursor = SelectionStep.move(cursor, in: items, delta: -1, extending: true)
+        cursor = ListSelectionMover.move(cursor, in: items, delta: -1, extending: true)
         #expect(cursor.selection == ["b", "c"])
         #expect(cursor.lead == "c")
-        cursor = SelectionStep.move(cursor, in: items, delta: -1, extending: true)
+        cursor = ListSelectionMover.move(cursor, in: items, delta: -1, extending: true)
         #expect(cursor.selection == ["b"])
-        cursor = SelectionStep.move(cursor, in: items, delta: -1, extending: true)
+        cursor = ListSelectionMover.move(cursor, in: items, delta: -1, extending: true)
         #expect(cursor.selection == ["a", "b"])
         #expect(cursor.anchor == "b")
         #expect(cursor.lead == "a")
-        cursor = SelectionStep.move(cursor, in: items, delta: 1, extending: false)
+        cursor = ListSelectionMover.move(cursor, in: items, delta: 1, extending: false)
         #expect(cursor.selection == ["b"])
         #expect(cursor.anchor == "b")
         #expect(cursor.lead == "b")
@@ -50,7 +45,7 @@ struct SelectionStepTests {
 
     @Test func extendingClampsAtTheEndsAndSelectsTheFirstItemFromEmpty() {
         let items = ["a", "b"]
-        let atEnd = SelectionStep.move(
+        let atEnd = ListSelectionMover.move(
             SelectionCursor(selection: ["a", "b"], anchor: "a", lead: "b"),
             in: items,
             delta: 1,
@@ -58,7 +53,7 @@ struct SelectionStepTests {
         )
         #expect(atEnd.selection == ["a", "b"])
         #expect(atEnd.lead == "b")
-        let fromEmpty = SelectionStep.move(
+        let fromEmpty = ListSelectionMover.move(
             SelectionCursor(selection: [], anchor: nil, lead: nil),
             in: items,
             delta: 1,
@@ -67,7 +62,7 @@ struct SelectionStepTests {
         #expect(fromEmpty.selection == ["a"])
         #expect(fromEmpty.anchor == "a")
         #expect(fromEmpty.lead == "a")
-        let upward = SelectionStep.move(
+        let upward = ListSelectionMover.move(
             SelectionCursor(selection: [], anchor: nil, lead: nil),
             in: items,
             delta: -1,
@@ -77,7 +72,7 @@ struct SelectionStepTests {
     }
 }
 
-struct OpenDocumentEventTests {
+struct AppleEventFileURLsTests {
     @Test func readsFileURLsFromAnOpenDocumentsEvent() {
         let event = NSAppleEventDescriptor(
             eventClass: AEEventClass(kCoreEventClass),
@@ -90,12 +85,12 @@ struct OpenDocumentEventTests {
         let folder = URL(fileURLWithPath: "/Users/kaol/Projects/git-sprout")
         list.insert(NSAppleEventDescriptor(fileURL: folder), at: 1)
         event.setParam(list, forKeyword: keyDirectObject)
-        let urls = OpenDocumentEvent.urls(from: event)
+        let urls = AppleEventFileURLs.urls(from: event)
         #expect(urls.map { $0.path(percentEncoded: false) } == [folder.path(percentEncoded: false)])
     }
 }
 
-struct RepositoryPathTests {
+struct RepositoryPathResolverTests {
     @Test func containingDirectoryKeepsAFolderAndUsesAFileParent() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("gitsprout-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -103,18 +98,18 @@ struct RepositoryPathTests {
         let file = root.appendingPathComponent("note.txt")
         try Data("a".utf8).write(to: file)
         let folder = root.path(percentEncoded: false)
-        #expect(RepositoryPath.containingDirectory(for: folder) == folder)
-        #expect(RepositoryPath.containingDirectory(for: file.path(percentEncoded: false)) == folder)
+        #expect(RepositoryPathResolver.containingDirectory(for: folder) == folder)
+        #expect(RepositoryPathResolver.containingDirectory(for: file.path(percentEncoded: false)) == folder)
         let missing = root.appendingPathComponent("missing").path(percentEncoded: false)
-        #expect(RepositoryPath.containingDirectory(for: missing) == missing)
+        #expect(RepositoryPathResolver.containingDirectory(for: missing) == missing)
     }
 
     @Test func menuTitleUsesTheFolderNameUntilNamesCollide() {
         let client = "/work/client/app"
         let server = "/work/server/app"
-        #expect(RepositoryPath.menuTitle(for: client, among: [client]) == "app")
-        #expect(RepositoryPath.menuTitle(for: client, among: [client, server]) == "app — client")
-        #expect(RepositoryPath.menuTitle(for: server, among: [client, server]) == "app — server")
+        #expect(RepositoryPathResolver.menuTitle(for: client, among: [client]) == "app")
+        #expect(RepositoryPathResolver.menuTitle(for: client, among: [client, server]) == "app — client")
+        #expect(RepositoryPathResolver.menuTitle(for: server, among: [client, server]) == "app — server")
     }
 }
 
@@ -436,12 +431,12 @@ struct ParserTests {
     }
 
     @Test func commitMessageGetsABlankSecondLine() {
-        #expect(CommitMessageText.insertingBlankSecondLine("subject") == "subject")
-        #expect(CommitMessageText.insertingBlankSecondLine("subject\n\nbody") == "subject\n\nbody")
-        #expect(CommitMessageText.insertingBlankSecondLine("subject\nbody\nmore") == "subject\n\nbody\nmore")
-        #expect(CommitMessageText.insertingBlankSecondLine("subject\r\nbody") == "subject\n\nbody")
-        #expect(CommitMessageText.insertingBlankSecondLine("subject\n  \nbody") == "subject\n\nbody")
-        #expect(CommitMessageText.insertingBlankSecondLine("") == "")
+        #expect(CommitMessageFormatter.insertingBlankSecondLine("subject") == "subject")
+        #expect(CommitMessageFormatter.insertingBlankSecondLine("subject\n\nbody") == "subject\n\nbody")
+        #expect(CommitMessageFormatter.insertingBlankSecondLine("subject\nbody\nmore") == "subject\n\nbody\nmore")
+        #expect(CommitMessageFormatter.insertingBlankSecondLine("subject\r\nbody") == "subject\n\nbody")
+        #expect(CommitMessageFormatter.insertingBlankSecondLine("subject\n  \nbody") == "subject\n\nbody")
+        #expect(CommitMessageFormatter.insertingBlankSecondLine("") == "")
     }
 
     @Test func diffTextLinesStayOnTheGutterPitch() {
@@ -461,7 +456,7 @@ struct ParserTests {
     @Test func missingNewlineLineStaysOnTheGutterPitch() throws {
         let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let lineHeight = ceil(font.boundingRectForFont.height)
-        let note = DiffLine(id: 1, kind: .meta, text: MissingNewlineNote.rawLine)
+        let note = DiffLine(id: 1, kind: .meta, text: NoNewlineAtEOFMarker.rawLine)
         let lines = [
             NumberedDiffLine(line: DiffLine(id: 0, kind: .addition, text: "alpha"), oldNumber: nil, newNumber: 1, missingNewline: nil),
             NumberedDiffLine(line: note, oldNumber: nil, newNumber: nil, missingNewline: .missing)
@@ -473,9 +468,9 @@ struct ParserTests {
         #expect(origins.count == lines.count)
         let shown = view.string.split(separator: "\n", omittingEmptySubsequences: false)
         #expect(shown.count == 2)
-        #expect(shown[1] == Substring(MissingNewlineNote.title))
+        #expect(shown[1] == Substring(NoNewlineAtEOFMarker.title))
         let layout = try #require(view.layoutManager)
-        let range = (view.string as NSString).range(of: MissingNewlineNote.title)
+        let range = (view.string as NSString).range(of: NoNewlineAtEOFMarker.title)
         let origin = layout.location(forGlyphAt: layout.glyphIndexForCharacter(at: range.location))
         #expect(abs(origin.x - DiffColumnTextView.missingNewlineIndent) < 1)
     }
@@ -498,7 +493,7 @@ struct ParserTests {
         #expect(document.hunks[0].patch.contains("@@ -1,2 +1,3 @@ heading"))
         #expect(document.hunks[0].heading == "heading")
         let selected = Set(document.hunks[0].lines.filter { $0.text == "old" || $0.text == "extra" }.map(\.id))
-        let partial = DiffLinePatch.make(document: document, selectedIDs: selected)
+        let partial = PartialPatchBuilder.make(document: document, selectedIDs: selected)
         #expect(partial?.contains("@@ -1,2 +1,2 @@ heading") == true)
         #expect(partial?.contains("-old") == true)
         #expect(partial?.contains("+extra") == true)
@@ -519,12 +514,12 @@ struct ParserTests {
         let document = GitDiffParser.parse(Data(patch.utf8))
         let lines = document.hunks[0].lines
         #expect(lines.map(\.kind) == [.deletion, .meta, .addition, .meta])
-        #expect(lines[1].text == MissingNewlineNote.rawLine)
-        #expect(MissingNewlineNote.state(of: lines[1], previous: .deletion) == .resolved)
-        #expect(MissingNewlineNote.state(of: lines[3], previous: .addition) == .missing)
-        #expect(MissingNewlineNote.state(of: lines[3], previous: .context) == .missing)
-        let partial = DiffLinePatch.make(document: document, selectedIDs: [lines[0].id])
-        #expect(partial?.contains(MissingNewlineNote.rawLine) == true)
+        #expect(lines[1].text == NoNewlineAtEOFMarker.rawLine)
+        #expect(NoNewlineAtEOFMarker.state(of: lines[1], previous: .deletion) == .resolved)
+        #expect(NoNewlineAtEOFMarker.state(of: lines[3], previous: .addition) == .missing)
+        #expect(NoNewlineAtEOFMarker.state(of: lines[3], previous: .context) == .missing)
+        let partial = PartialPatchBuilder.make(document: document, selectedIDs: [lines[0].id])
+        #expect(partial?.contains(NoNewlineAtEOFMarker.rawLine) == true)
     }
 
     @Test func diffParserKeepsRenameAsOneChange() {
@@ -1121,7 +1116,7 @@ struct GitClientTests {
         let diff = try await client.diff(path: "lines.txt", staged: false)
         let hunk = try #require(diff.hunks.first)
         let selected = Set(hunk.lines.filter { $0.text == "beta" || $0.text == "BETA" }.map(\.id))
-        let patch = try #require(DiffLinePatch.make(document: diff, selectedIDs: selected))
+        let patch = try #require(PartialPatchBuilder.make(document: diff, selectedIDs: selected))
         try await client.apply(patch: patch, cached: true, reverse: false)
 
         let staged = try await client.diff(path: "lines.txt", staged: true)
@@ -1132,7 +1127,7 @@ struct GitClientTests {
 
         let stagedLines = staged.hunks.flatMap(\.lines)
         let unstageIDs = Set(stagedLines.filter { $0.text == "BETA" || $0.text == "beta" }.map(\.id))
-        let reverse = try #require(DiffLinePatch.make(document: staged, selectedIDs: unstageIDs))
+        let reverse = try #require(PartialPatchBuilder.make(document: staged, selectedIDs: unstageIDs))
         try await client.apply(patch: reverse, cached: true, reverse: true)
         let cleared = try await client.diff(path: "lines.txt", staged: true)
         #expect(!cleared.hunks.contains { $0.lines.contains { $0.text == "BETA" } })
@@ -1574,10 +1569,10 @@ struct GitClientTests {
         let first = makePDF(pages: 1)
         let second = makePDF(pages: 2)
         #expect(ImageDiffView.images(from: second).count == 2)
-        #expect(ImagePaths.isImage("Notes.PDF"))
-        #expect(ImagePaths.isImage("photo.psd"))
-        #expect(ImagePaths.isImage("plate.exr"))
-        #expect(!ImagePaths.isImage("notes.txt"))
+        #expect(ImageFileType.isImage("Notes.PDF"))
+        #expect(ImageFileType.isImage("photo.psd"))
+        #expect(ImageFileType.isImage("plate.exr"))
+        #expect(!ImageFileType.isImage("notes.txt"))
 
         let repo = try TemporaryRepo()
         let file = repo.root.appendingPathComponent("notes.pdf")
@@ -1595,13 +1590,13 @@ struct GitClientTests {
 struct MissingNewlineFixTests {
     @Test func indexParserKeepsARegularStageZeroBlob() {
         let staged = Data("100644 abcdef 0\tnote.txt\0".utf8)
-        #expect(IndexStageParser.regularBlob(staged)?.mode == "100644")
-        #expect(IndexStageParser.regularBlob(staged)?.hash == "abcdef")
-        #expect(IndexStageParser.regularBlob(Data("120000 abcdef 0\tlink\0".utf8)) == nil)
-        #expect(IndexStageParser.regularBlob(Data("100644 abcdef 1\ta\0".utf8)) == nil)
+        #expect(GitLsFilesParser.regularBlob(staged)?.mode == "100644")
+        #expect(GitLsFilesParser.regularBlob(staged)?.hash == "abcdef")
+        #expect(GitLsFilesParser.regularBlob(Data("120000 abcdef 0\tlink\0".utf8)) == nil)
+        #expect(GitLsFilesParser.regularBlob(Data("100644 abcdef 1\ta\0".utf8)) == nil)
         let later = Data("100644 abcdef 1\ta\0100755 fedcba 0\tb\0".utf8)
-        #expect(IndexStageParser.regularBlob(later)?.mode == "100755")
-        #expect(IndexStageParser.regularBlob(later)?.hash == "fedcba")
+        #expect(GitLsFilesParser.regularBlob(later)?.mode == "100755")
+        #expect(GitLsFilesParser.regularBlob(later)?.hash == "fedcba")
     }
 
     @Test func appendingANewlineClearsTheWorktreeMarker() async throws {
@@ -1613,7 +1608,7 @@ struct MissingNewlineFixTests {
         try Data("hello".utf8).write(to: file)
         let client = GitClient(workingDirectory: repo.root.path)
         let before = try await client.diff(path: "note.txt", staged: false)
-        #expect(before.hunks.flatMap(\.lines).contains { $0.text == MissingNewlineNote.rawLine })
+        #expect(before.hunks.flatMap(\.lines).contains { $0.text == NoNewlineAtEOFMarker.rawLine })
         try await client.appendTrailingNewline(path: "note.txt", staged: false)
         #expect(try Data(contentsOf: file) == Data("hello\n".utf8))
         let after = try await client.diff(path: "note.txt", staged: false)
@@ -1635,7 +1630,7 @@ struct MissingNewlineFixTests {
         let staged = try await client.diff(path: "note.txt", staged: true)
         #expect(staged.isEmpty)
         let unstaged = try await client.diff(path: "note.txt", staged: false)
-        let markers = unstaged.hunks.flatMap(\.lines).filter { $0.text == MissingNewlineNote.rawLine }
+        let markers = unstaged.hunks.flatMap(\.lines).filter { $0.text == NoNewlineAtEOFMarker.rawLine }
         #expect(markers.isEmpty)
         #expect(unstaged.hunks.flatMap(\.lines).contains { $0.text == "hello world" })
     }

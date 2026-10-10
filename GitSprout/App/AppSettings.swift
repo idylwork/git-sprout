@@ -1,8 +1,3 @@
-//
-//  AppSettings.swift
-//  GitSprout
-//
-
 import SwiftUI
 
 enum AppSettings {

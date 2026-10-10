@@ -1,8 +1,3 @@
-//
-//  AppModel.swift
-//  GitSprout
-//
-
 import AppKit
 import Observation
 
@@ -37,7 +32,7 @@ final class AppModel {
 
     func openExternal(urls: [URL]) {
         guard let url = urls.first(where: \.isFileURL) else { return }
-        let path = RepositoryPath.containingDirectory(for: url.path(percentEncoded: false))
+        let path = RepositoryPathResolver.containingDirectory(for: url.path(percentEncoded: false))
         let now = Date()
         if let lastExternalOpen, lastExternalOpen.path == path, now.timeIntervalSince(lastExternalOpen.date) < 1 {
             return
@@ -62,7 +57,7 @@ final class AppModel {
 
     func open(path: String, generation: Int? = nil) async {
         let generation = generation ?? beginOpen()
-        let directory = RepositoryPath.containingDirectory(for: path)
+        let directory = RepositoryPathResolver.containingDirectory(for: path)
         if directory == session?.rootPath { return }
         do {
             let root = try await GitClient.resolveRepository(at: directory)
@@ -95,7 +90,7 @@ final class AppModel {
     }
 }
 
-nonisolated enum RepositoryPath {
+nonisolated enum RepositoryPathResolver {
     static func containingDirectory(for path: String) -> String {
         let url = URL(fileURLWithPath: path).standardizedFileURL
         let standardized = url.path(percentEncoded: false)
