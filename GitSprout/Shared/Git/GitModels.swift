@@ -107,12 +107,15 @@ nonisolated struct CommitRecord: Identifiable, Sendable, Equatable {
     var authorName: String
     var authorEmail: String
     var authoredAt: Date
-    var decoration: String
+    /// このコミットを指すブランチやタグの表示名。
+    var refs: [String]
     var subject: String
     /// 空行のあとの本文。履歴の詳細に出す。
     var body: String
 
     var id: String { oid }
+
+    var decoration: String { refs.joined(separator: ", ") }
 
     static let uncommittedOID = "UNCOMMITTED"
 
@@ -122,7 +125,7 @@ nonisolated struct CommitRecord: Identifiable, Sendable, Equatable {
         authorName: String = "",
         authorEmail: String = "",
         authoredAt: Date = .distantPast,
-        decoration: String = "",
+        refs: [String] = [],
         subject: String = "",
         body: String = ""
     ) {
@@ -131,7 +134,7 @@ nonisolated struct CommitRecord: Identifiable, Sendable, Equatable {
         self.authorName = authorName
         self.authorEmail = authorEmail
         self.authoredAt = authoredAt
-        self.decoration = decoration
+        self.refs = refs
         self.subject = subject
         self.body = body
     }

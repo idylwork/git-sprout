@@ -110,6 +110,7 @@ struct WorkspaceView: View {
             )
         ) {
             Button("OK", role: .cancel) {}
+                .keyboardShortcut(.defaultAction)
         } message: {
             Text(session.errorMessage ?? "")
         }
@@ -129,8 +130,10 @@ struct WorkspaceView: View {
                 Button(confirm.confirmTitle) {
                     Task { await session.perform(confirm) }
                 }
+                .keyboardShortcut(.defaultAction)
             }
             Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.cancelAction)
         } message: { confirm in
             Text(confirm.message)
         }
@@ -159,7 +162,9 @@ struct WorkspaceView: View {
                 Task { await session.createBranch(from: source, named: draft) }
             }
             .disabled(createBranchDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.cancelAction)
         } message: {
             Text("Create a new branch from \(createBranchSource).")
         }
@@ -176,7 +181,9 @@ struct WorkspaceView: View {
                 let draft = renameDraft
                 Task { await session.renameBranch(original, to: draft) }
             }
+            .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.cancelAction)
         } message: {
             Text("Choose a new name for \(renameOriginal).")
         }

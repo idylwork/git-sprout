@@ -6,6 +6,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
     case discardAllUnstaged
     case discardStaged(FileChange)
     case discardHunk(String)
+    case discardLines(String)
     case dropStash(String)
     case detach(String)
     case deleteBranch(String)
@@ -21,6 +22,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
         case .discardAllUnstaged: return "unstaged-all"
         case .discardStaged(let file): return "staged-\(file.path)"
         case .discardHunk(let patch): return "hunk-\(patch.hashValue)"
+        case .discardLines(let patch): return "lines-\(patch.hashValue)"
         case .dropStash(let ref): return "stash-\(ref)"
         case .detach(let oid): return "detach-\(oid)"
         case .deleteBranch(let name): return "delete-branch-\(name)"
@@ -34,7 +36,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk:
+        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk, .discardLines:
             return String(localized: "Discard Changes?")
         case .dropStash:
             return String(localized: "Drop Stash?")
@@ -63,6 +65,8 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
             return String(localized: "Unstaged changes cannot be undone.")
         case .discardHunk:
             return String(localized: "Changes in the selected hunk cannot be undone.")
+        case .discardLines:
+            return String(localized: "Changes in the selected lines cannot be undone.")
         case .dropStash:
             return String(localized: "A dropped stash cannot be restored.")
         case .detach:
@@ -87,7 +91,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
 
     var confirmTitle: String {
         switch self {
-        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk:
+        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk, .discardLines:
             return String(localized: "Discard")
         case .dropStash:
             return String(localized: "Drop")
@@ -108,12 +112,13 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
         }
     }
 
+    /// 破壊的影響の大きい操作。赤いボタンにしてキーボードでは実行させない。
     var isDestructive: Bool {
         switch self {
-        case .mergeBranch, .rebaseBranch:
-            return false
-        default:
+        case .pull, .forcePush:
             return true
+        default:
+            return false
         }
     }
 }
@@ -855,6 +860,20 @@ final class WorkspaceSession {
         pendingConfirm = .detach(oid)
     }
 
+    /// コミットを指すローカルブランチがあればそれに切り替え、なければ切り離して確認を出す。
+    func checkoutCommit(_ commit: CommitRecord) async {
+        let locals = branches.filter { $0.sync != .remoteOnly && $0.oid == commit.oid }
+        guard !locals.isEmpty else {
+            confirmDetach(commit.oid)
+            return
+        }
+        // 今いるブランチがすでにこのコミットにあるなら何もしない
+        guard !locals.contains(where: \.isCurrent) else { return }
+        // 複数あるときは履歴に並ぶ順を優先する
+        let preferred = commit.refs.lazy.compactMap { ref in locals.first { $0.name == ref } }.first
+        await switchBranch((preferred ?? locals[0]).name)
+    }
+
     func confirmUndoCommit() {
         pendingConfirm = .undoCommit
     }
@@ -1109,7 +1128,7 @@ final class WorkspaceSession {
             await mutate { try await client.discardUnstaged(files) }
         case .discardStaged(let file):
             await mutate { try await client.discardStaged([file]) }
-        case .discardHunk(let patch):
+        case .discardHunk(let patch), .discardLines(let patch):
             await mutate { try await client.apply(patch: patch, cached: false, reverse: true) }
         case .dropStash(let ref):
             await mutate {

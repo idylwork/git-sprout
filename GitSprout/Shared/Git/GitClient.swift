@@ -209,6 +209,7 @@ actor GitClient {
     }
 
     /// ステージ済み差分のテキスト。要約が先、パッチが後。候補の入力に使う。
+    /// 上限を超えた分は捨てる。候補の入力は先頭だけで足りるので、打ち切りは失敗にしない。
     func stagedDiffText() async throws -> String {
         let stat = try await capture(
             key: "staged-diff-text",
@@ -216,14 +217,18 @@ actor GitClient {
             limit: 8_000,
             preempt: true
         )
-        try requireOK(stat, fallback: String(localized: "Couldn't read the staged changes."))
+        if !stat.truncated {
+            try requireOK(stat, fallback: String(localized: "Couldn't read the staged changes."))
+        }
         let patch = try await capture(
             key: "staged-diff-text",
             args: ["diff", "--cached", "--find-renames", "--no-ext-diff", "--no-color", "-U3"],
             limit: 12_000,
             preempt: true
         )
-        try requireOK(patch, fallback: String(localized: "Couldn't read the staged changes."))
+        if !patch.truncated {
+            try requireOK(patch, fallback: String(localized: "Couldn't read the staged changes."))
+        }
         let summary = String(decoding: stat.stdout, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let changes = String(decoding: patch.stdout, as: UTF8.self)

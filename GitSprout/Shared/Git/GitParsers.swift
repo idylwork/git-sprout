@@ -63,7 +63,7 @@ nonisolated enum GitLogParser {
                 authorName: fields[2],
                 authorEmail: fields[3],
                 authoredAt: formatter.date(from: fields[4]) ?? .distantPast,
-                decoration: displayDecoration(fields[5]),
+                refs: displayRefs(fields[5]),
                 subject: subject,
                 body: body
             ))
@@ -84,12 +84,12 @@ nonisolated enum GitLogParser {
     }
 }
 
-nonisolated func displayDecoration(_ raw: String) -> String {
+nonisolated func displayRefs(_ raw: String) -> [String] {
     var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if text.count >= 2, text.hasPrefix("("), text.hasSuffix(")") {
         text = String(text.dropFirst().dropLast())
     }
-    let pieces = text.split(separator: ",").compactMap { rawPiece -> String? in
+    return text.split(separator: ",").compactMap { rawPiece -> String? in
         var item = rawPiece.trimmingCharacters(in: .whitespacesAndNewlines)
         if item.isEmpty { return nil }
         if let arrow = item.range(of: " -> ") {
@@ -103,7 +103,6 @@ nonisolated func displayDecoration(_ raw: String) -> String {
         }
         return item.isEmpty ? nil : item
     }
-    return pieces.joined(separator: ", ")
 }
 
 nonisolated enum GitBranchParser {
@@ -387,14 +386,17 @@ nonisolated enum GitDiffParser {
 }
 
 /// 選択した追加・削除行だけを含む `git apply` 用パッチを作る。
+/// `forDiscard` が真のときは作業ツリー側を基準にする。逆向きに当てて選択行だけを元に戻すため、
+/// 選ばなかった追加行を文脈として残し、選ばなかった削除行は捨てる。
 nonisolated enum PartialPatchBuilder {
-    static func make(document: DiffDocument, selectedIDs: Set<Int>) -> String? {
-        let bodies = document.hunks.compactMap { rewrite($0, selectedIDs: selectedIDs) }
+    static func make(document: DiffDocument, selectedIDs: Set<Int>, forDiscard: Bool = false) -> String? {
+        let bodies = document.hunks.compactMap { rewrite($0, selectedIDs: selectedIDs, forDiscard: forDiscard) }
         guard !bodies.isEmpty else { return nil }
         return document.header + bodies.joined()
     }
 
-    private static func rewrite(_ hunk: DiffHunk, selectedIDs: Set<Int>) -> String? {
+    private static func rewrite(_ hunk: DiffHunk, selectedIDs: Set<Int>, forDiscard: Bool) -> String? {
+        let keptSide: DiffLine.Kind = forDiscard ? .addition : .deletion
         var emitted: [String] = []
         var oldCount = 0
         var newCount = 0
@@ -415,7 +417,7 @@ nonisolated enum PartialPatchBuilder {
                 if selectedIDs.contains(line.id) {
                     kind = line.kind
                     keptChange = true
-                } else if line.kind == .deletion {
+                } else if line.kind == keptSide {
                     kind = .context
                 } else {
                     index += 1

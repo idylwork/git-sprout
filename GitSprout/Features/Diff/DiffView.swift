@@ -12,6 +12,8 @@ struct DiffView: View {
     var onPrimary: ((DiffHunk) -> Void)?
     var onSecondary: ((DiffHunk) -> Void)?
     var onStageLines: ((String) -> Void)? = nil
+    /// 選択行を作業ツリーから破棄する。渡すパッチは逆向きに当てる前提。
+    var onDiscardLines: ((String) -> Void)? = nil
     /// 作業ツリーまたはインデックスの末尾に、足りない改行を足す。
     var onFixMissingNewline: (() -> Void)? = nil
 
@@ -122,6 +124,13 @@ struct DiffView: View {
                 .disabled(!actionsEnabled)
                 .fixedSize()
             }
+            if selectedCount > 0, onDiscardLines != nil {
+                Button(discardSelectionTitle(count: selectedCount), role: .destructive) {
+                    discardLines(in: hunk, document: document)
+                }
+                .disabled(!actionsEnabled)
+                .fixedSize()
+            }
             if hunkStaged == nil, let primaryTitle, let onPrimary {
                 Button(primaryTitle) { onPrimary(hunk) }
                     .disabled(!actionsEnabled)
@@ -157,6 +166,11 @@ struct DiffView: View {
         }
         if count == 1 { return String(localized: "Stage 1 Line") }
         return String(localized: "Stage \(count) Lines")
+    }
+
+    private func discardSelectionTitle(count: Int) -> String {
+        if count == 1 { return String(localized: "Discard 1 Line") }
+        return String(localized: "Discard \(count) Lines")
     }
 
     private func wrappedDocument(
@@ -392,6 +406,14 @@ struct DiffView: View {
             selectionAnchor = nil
         }
         onStageLines?(patch)
+    }
+
+    private func discardLines(in hunk: DiffHunk, document: DiffDocument) {
+        let ids = Set(hunk.lines.map(\.id)).intersection(selectedLineIDs)
+        guard actionsEnabled,
+              let patch = PartialPatchBuilder.make(document: document, selectedIDs: ids, forDiscard: true)
+        else { return }
+        onDiscardLines?(patch)
     }
 
     private func canFix(_ line: NumberedDiffLine) -> Bool {
