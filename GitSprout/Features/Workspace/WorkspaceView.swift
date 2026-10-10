@@ -110,6 +110,7 @@ struct WorkspaceView: View {
             )
         ) {
             Button("OK", role: .cancel) {}
+                .keyboardShortcut(.defaultAction)
         } message: {
             Text(session.errorMessage ?? "")
         }
@@ -125,22 +126,37 @@ struct WorkspaceView: View {
                 Button(confirm.confirmTitle, role: .destructive) {
                     Task { await session.perform(confirm) }
                 }
+                if confirm.overwrite != nil {
+                    Button("Show Changes…") {
+                        Task { await session.showOverwritePreview(confirm) }
+                    }
+                }
             } else {
                 Button(confirm.confirmTitle) {
                     Task { await session.perform(confirm) }
                 }
+                .keyboardShortcut(.defaultAction)
             }
             Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.cancelAction)
         } message: { confirm in
             Text(confirm.message)
         }
         .sheet(
             isPresented: Binding(
-                get: { session.fileHistoryPath != nil && !session.showsRangeDiff },
+                get: { session.fileHistoryPath != nil && !session.showsRangeDiff && session.overwritePreview == nil },
                 set: { if !$0 { session.closeFileHistory() } }
             )
         ) {
             FileHistorySheet(session: session)
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { session.overwritePreview != nil },
+                set: { if !$0 { session.dismissOverwritePreview() } }
+            )
+        ) {
+            OverwritePreviewSheet(session: session)
         }
         .sheet(isPresented: $showingRemoteBranchSheet) {
             RemoteBranchesSheet(session: session)
@@ -159,7 +175,9 @@ struct WorkspaceView: View {
                 Task { await session.createBranch(from: source, named: draft) }
             }
             .disabled(createBranchDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.cancelAction)
         } message: {
             Text("Create a new branch from \(createBranchSource).")
         }
@@ -176,7 +194,9 @@ struct WorkspaceView: View {
                 let draft = renameDraft
                 Task { await session.renameBranch(original, to: draft) }
             }
+            .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.cancelAction)
         } message: {
             Text("Choose a new name for \(renameOriginal).")
         }

@@ -4,6 +4,16 @@ struct HistoryView: View {
     var session: WorkspaceSession
     @Environment(\.keyboardFocus) private var keyboardFocus
     @State private var appliedFocus = 0
+    @Namespace private var refChips
+
+    /// ブランチがどのコミットにあるか。変わったときだけチップを動かす。
+    private var refPlacement: [String: [String]] {
+        var placement: [String: [String]] = [:]
+        for row in session.historyRows where !row.commit.refs.isEmpty {
+            placement[row.id] = row.commit.refs
+        }
+        return placement
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,7 +30,8 @@ struct HistoryView: View {
                                 HistoryRow(
                                     row: row,
                                     isSelected: session.selectedCommit == row.id,
-                                    caption: row.id == CommitRecord.uncommittedOID ? uncommittedCaption : nil
+                                    caption: row.id == CommitRecord.uncommittedOID ? uncommittedCaption : nil,
+                                    refChips: refChips
                                 )
                                     .id(row.id)
                                     .contentShape(Rectangle())
@@ -28,6 +39,14 @@ struct HistoryView: View {
                                         keyboardFocus?.target = .commits
                                         guard session.selectedCommit != row.id else { return }
                                         Task { await session.selectCommit(row.id) }
+                                    }
+                                    .contextMenu {
+                                        if row.id != CommitRecord.uncommittedOID {
+                                            CommitContextMenu(
+                                                items: session.commitMenu(for: row.commit),
+                                                isMutating: session.isMutating
+                                            )
+                                        }
                                     }
                                     .onAppear {
                                         if row.id != CommitRecord.uncommittedOID {
@@ -44,6 +63,7 @@ struct HistoryView: View {
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .animation(.smooth(duration: 0.35), value: refPlacement)
                     }
                     .keyboardTarget(.commits, focusable: true)
                     .selectionArrows(target: .commits) { delta, _ in
@@ -81,6 +101,63 @@ struct HistoryView: View {
     private var uncommittedCaption: String {
         if session.changeCount == 1 { return String(localized: "1 change") }
         return String(localized: "\(session.changeCount) changes")
+    }
+}
+
+extension WorkspaceSession {
+    /// コミット詳細の見出しメニューと履歴行の右クリックメニューで共有する項目。
+    func commitMenu(for commit: CommitRecord) -> [SectionMenuItem] {
+        let isCheckedOut = !head.oid.isEmpty && commit.oid == head.oid
+        var menu = [
+            SectionMenuItem(
+                id: "checkout",
+                title: String(localized: "Checkout"),
+                action: { Task { await self.checkoutCommit(commit) } }
+            ),
+            SectionMenuItem(
+                id: "diff",
+                title: String(localized: "View Diff from Here"),
+                disabled: head.oid.isEmpty || isCheckedOut,
+                action: {
+                    Task {
+                        // 範囲 Diff は選択中のコミットを起点にするため、右クリックした行を先に選ぶ
+                        if self.selectedCommit != commit.oid {
+                            await self.selectCommit(commit.oid)
+                        }
+                        await self.showRangeDiff()
+                    }
+                }
+            )
+        ]
+        if isCheckedOut {
+            menu.append(
+                SectionMenuItem(
+                    id: "undo",
+                    title: String(localized: "Undo Commit"),
+                    destructive: true,
+                    disabled: commit.parents.isEmpty,
+                    dividerBefore: true,
+                    action: { self.confirmUndoCommit() }
+                )
+            )
+        }
+        return menu
+    }
+}
+
+/// 履歴行の右クリックメニュー。
+private struct CommitContextMenu: View {
+    var items: [SectionMenuItem]
+    var isMutating: Bool
+
+    var body: some View {
+        ForEach(items) { item in
+            if item.dividerBefore {
+                Divider()
+            }
+            Button(item.title, role: item.destructive ? .destructive : nil, action: item.action)
+                .disabled(item.disabled || isMutating)
+        }
     }
 }
 
@@ -146,6 +223,7 @@ private struct HistoryRow: View {
     var row: GraphRow
     var isSelected: Bool
     var caption: String? = nil
+    var refChips: Namespace.ID
 
     private var isUncommitted: Bool { row.commit.oid == CommitRecord.uncommittedOID }
 
@@ -168,11 +246,15 @@ private struct HistoryRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             } else if !isUncommitted {
-                if !row.commit.decoration.isEmpty {
-                    Text(row.commit.decoration)
-                        .font(.caption)
-                        .foregroundStyle(Color.accentColor)
-                        .lineLimit(1)
+                if !row.commit.refs.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(row.commit.refs, id: \.self) { ref in
+                            RefChip(name: ref)
+                                // 同じ名前のチップを行をまたいで対応させ、付け替え時にスライドさせる
+                                .matchedGeometryEffect(id: ref, in: refChips)
+                        }
+                    }
+                    .fixedSize()
                 }
                 Spacer(minLength: 8)
                 Text(HistoryMetrics.dateFormatter.string(from: row.commit.authoredAt))
@@ -189,6 +271,20 @@ private struct HistoryRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: HistoryMetrics.rowHeight)
         .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
+    }
+}
+
+private struct RefChip: View {
+    var name: String
+
+    var body: some View {
+        Text(name)
+            .font(.caption)
+            .foregroundStyle(Color.accentColor)
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(Color.accentColor.opacity(0.15), in: Capsule())
     }
 }
 
@@ -318,33 +414,7 @@ struct HistoryDetailView: View {
 
     private var commitFileMenu: [SectionMenuItem] {
         guard let commit = session.selectedCommitRecord else { return [] }
-        let isCheckedOut = !session.head.oid.isEmpty && commit.oid == session.head.oid
-        var menu = [
-            SectionMenuItem(
-                id: "checkout",
-                title: String(localized: "Checkout"),
-                action: { session.confirmDetach(commit.oid) }
-            ),
-            SectionMenuItem(
-                id: "diff",
-                title: String(localized: "View Diff from Here"),
-                disabled: session.head.oid.isEmpty || isCheckedOut,
-                action: { Task { await session.showRangeDiff() } }
-            )
-        ]
-        if isCheckedOut {
-            menu.append(
-                SectionMenuItem(
-                    id: "undo",
-                    title: String(localized: "Undo Commit"),
-                    destructive: true,
-                    disabled: commit.parents.isEmpty,
-                    dividerBefore: true,
-                    action: { session.confirmUndoCommit() }
-                )
-            )
-        }
-        return menu
+        return session.commitMenu(for: commit)
     }
 
     private var commitFilesHeader: some View {

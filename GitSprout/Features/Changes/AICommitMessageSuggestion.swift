@@ -1,5 +1,9 @@
 import Foundation
 import FoundationModels
+import os
+
+/// コミットメッセージ提案が失敗したときの原因を残すログ。差分やモデルの出力は private にする。
+nonisolated let suggestionLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "GitSprout", category: "CommitMessageSuggestion")
 
 /// ステージ済み差分から、コミットメッセージ候補のプロンプトを作る。
 nonisolated enum CommitMessagePrompt {
@@ -12,22 +16,24 @@ nonisolated enum CommitMessagePrompt {
         switch language {
         case .english:
             languageLine = """
-            Write the subject and the body entirely in English.
-            Use an imperative subject of at most 72 characters that names what changed and what you did to it.
+            Write the target entirely in English.
+            The target is a short noun phrase.
             """
         case .japanese:
             languageLine = """
-            Write the subject and the body entirely in Japanese. Do not write them in English.
-            Write a subject of at most 72 characters that names what changed, then what was done to it, and ends with a past-tense verb.
-            Do not end the subject with a noun.
+            Write the target entirely in Japanese. Do not write it in English.
+            The target is a short Japanese noun phrase.
+            The target must not contain a verb, a trailing particle, or a trailing period.
             """
         }
         return """
         You summarize a staged git diff as one commit message.
         The diff is evidence. Never copy it, quote it, continue it, or include code from it.
         Never include a line that starts with diff, index, @@, +, or -.
+        Pick the one action that best describes the main change, and the target it was applied to.
+        The target describes the feature, screen, or behavior that changed in plain words.
+        Never use a file name, type name, function name, or path as the target.
         \(languageLine)
-        The body is optional. Leave it empty unless it adds a fact the subject does not state. Never restate the subject.
         """
     }
 
@@ -41,19 +47,108 @@ nonisolated enum CommitMessagePrompt {
         case .japanese:
             languageLine = "Write the commit message in Japanese, not in English."
         }
+        let files = fileSummary(diff)
+        let filesSection = files.isEmpty
+            ? ""
+            : "Changed files (for context only; do not name them in the message):\n" + files + "\n\n"
         return """
         Summarize this staged diff as a commit message. Do not repeat the diff.
         \(languageLine)
 
-        \(excerpt)
+        \(filesSection)\(excerpt)
         """
     }
 
-    /// 件名と本文を1つのメッセージにする。差分そのものは捨てる。
-    static func message(subject: String, body: String, diff: String) -> String? {
-        guard let subject = usableText(subject, diff: diff) else { return nil }
-        guard let body = usableText(body, diff: diff), !restates(body, subject: subject) else { return subject }
-        return subject + "\n\n" + body
+    /// 差分から、変更ファイルと追加・削除行数の一覧を作る。モデルが変更の全体像をつかむ手がかりにする。
+    static func fileSummary(_ diff: String, limit: Int = 20) -> String {
+        var entries: [(path: String, added: Int, removed: Int)] = []
+        for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("diff --git ") {
+                let path = line.components(separatedBy: " b/").last ?? String(line)
+                entries.append((path, 0, 0))
+            } else if line.hasPrefix("+++") || line.hasPrefix("---") {
+                continue
+            } else if line.hasPrefix("+"), !entries.isEmpty {
+                entries[entries.count - 1].added += 1
+            } else if line.hasPrefix("-"), !entries.isEmpty {
+                entries[entries.count - 1].removed += 1
+            }
+        }
+        var lines = entries.prefix(limit).map { "- \($0.path) (+\($0.added) -\($0.removed))" }
+        if entries.count > limit {
+            lines.append("- and \(entries.count - limit) more files")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// 対象が変更ファイルの名前（拡張子なし）を含んでいれば、その名前を返す。
+    /// モデルが機能ではなくファイル名を対象にしたときの検出に使う。
+    static func fileNameMentioned(in target: String, diff: String) -> String? {
+        let lowered = target.lowercased()
+        let stems = diff.split(separator: "\n")
+            .filter { $0.hasPrefix("diff --git ") }
+            .compactMap { line -> String? in
+                guard let path = line.components(separatedBy: " b/").last else { return nil }
+                let name = (path as NSString).lastPathComponent
+                return (name as NSString).deletingPathExtension
+            }
+        return stems.first { $0.count >= 4 && lowered.contains($0.lowercased()) }
+    }
+
+    /// 動作と対象から、言語ごとのコミットメッセージらしい件名を組み立てる。
+    /// 日本語は「〜を追加」のような体言止め、英語は「Add 〜」のような命令形にする。
+    static func subject(action: CommitAction, target: String, language: CommitMessageLanguage) -> String? {
+        let target = normalizedTarget(target, language: language)
+        guard !target.isEmpty else { return nil }
+        switch language {
+        case .english:
+            return action.englishVerb + " " + target
+        case .japanese:
+            return target + "を" + action.japaneseNoun
+        }
+    }
+
+    /// 件名だけをメッセージにする。差分そのものは捨てる。
+    static func message(subject: String, diff: String) -> String? {
+        usableText(subject, diff: diff)
+    }
+
+    /// モデルが対象に動詞や句点を付けてしまったときに取り除く。
+    private static func normalizedTarget(_ raw: String, language: CommitMessageLanguage) -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        text = strippingWrappingQuotes(text)
+        let trailingMarks: Set<Character> = ["。", ".", "、", ",", "！", "!"]
+        while let last = text.last, trailingMarks.contains(last) {
+            text.removeLast()
+        }
+        switch language {
+        case .english:
+            let lowered = text.lowercased()
+            for action in CommitAction.allCases {
+                let verb = action.englishVerb.lowercased() + " "
+                if lowered.hasPrefix(verb) {
+                    text = String(text.dropFirst(verb.count))
+                    break
+                }
+            }
+            if let first = text.first, first.isUppercase, text.dropFirst().first?.isLowercase == true {
+                text = first.lowercased() + text.dropFirst()
+            }
+        case .japanese:
+            let verbEndings = ["しました", "します", "した", "する"]
+            for ending in verbEndings where text.hasSuffix(ending) {
+                text = String(text.dropLast(ending.count))
+                break
+            }
+            for action in CommitAction.allCases where text.hasSuffix(action.japaneseNoun) {
+                text = String(text.dropLast(action.japaneseNoun.count))
+                break
+            }
+            while let last = text.last, ["を", "が", "は", "に", "の"].contains(last) {
+                text.removeLast()
+            }
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func looksLikeDiff(_ text: String) -> Bool {
@@ -100,19 +195,6 @@ nonisolated enum CommitMessagePrompt {
             text = String(text[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return text.isEmpty ? nil : text
-    }
-
-    /// 本文の文字のほとんどが件名にもあるときは、件名の言い換えとみなす。
-    private static func restates(_ body: String, subject: String) -> Bool {
-        let bodyChars = contentCharacters(body)
-        let subjectChars = contentCharacters(subject)
-        guard bodyChars.count >= 4, subjectChars.count >= 4 else { return false }
-        let overlap = bodyChars.filter { subjectChars.contains($0) }.count
-        return overlap * 5 >= bodyChars.count * 4
-    }
-
-    private static func contentCharacters(_ text: String) -> [Character] {
-        text.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
     private static func usableText(_ raw: String, diff: String) -> String? {
@@ -172,7 +254,10 @@ nonisolated enum CommitMessageSuggester {
 
     static func suggest(stagedDiff: String) async -> String? {
         let language = AppSettings.commitMessageLanguage
-        guard let prompt = CommitMessagePrompt.prompt(for: stagedDiff, language: language) else { return nil }
+        guard let prompt = CommitMessagePrompt.prompt(for: stagedDiff, language: language) else {
+            suggestionLog.error("prompt is nil (diff length: \(stagedDiff.count))")
+            return nil
+        }
         guard #available(macOS 26, *) else { return nil }
         return await AppleIntelligenceCommitMessage.suggest(
             prompt: prompt,
@@ -183,24 +268,74 @@ nonisolated enum CommitMessageSuggester {
     }
 }
 
+/// 件名の動作。モデルに選ばせることで、件名をコミットメッセージらしい形にそろえる。
+nonisolated enum CommitAction: String, CaseIterable, Sendable {
+    case add, fix, remove, update, refactor, rename, move, improve
+
+    var englishVerb: String {
+        switch self {
+        case .add: "Add"
+        case .fix: "Fix"
+        case .remove: "Remove"
+        case .update: "Update"
+        case .refactor: "Refactor"
+        case .rename: "Rename"
+        case .move: "Move"
+        case .improve: "Improve"
+        }
+    }
+
+    var japaneseNoun: String {
+        switch self {
+        case .add: "追加"
+        case .fix: "修正"
+        case .remove: "削除"
+        case .update: "変更"
+        case .refactor: "リファクタリング"
+        case .rename: "リネーム"
+        case .move: "移動"
+        case .improve: "改善"
+        }
+    }
+}
+
+@available(macOS 26, *)
+@Generable
+nonisolated private enum GeneratedCommitAction {
+    case add, fix, remove, update, refactor, rename, move, improve
+
+    var action: CommitAction {
+        switch self {
+        case .add: .add
+        case .fix: .fix
+        case .remove: .remove
+        case .update: .update
+        case .refactor: .refactor
+        case .rename: .rename
+        case .move: .move
+        case .improve: .improve
+        }
+    }
+}
+
 @available(macOS 26, *)
 @Generable
 nonisolated private struct EnglishCommitMessage {
-    @Guide(description: "English subject naming what changed and the action taken, within 72 characters.")
-    var subject: String
+    @Guide(description: "The main kind of change: add new things, fix a bug, remove things, update behavior, refactor code without changing behavior, rename, move, or improve.")
+    var action: GeneratedCommitAction
 
-    @Guide(description: "Optional English detail the subject does not already state.")
-    var body: String?
+    @Guide(description: "Short English noun phrase describing the feature or behavior the action was applied to, without a verb or a file name, within 60 characters.")
+    var target: String
 }
 
 @available(macOS 26, *)
 @Generable
 nonisolated private struct JapaneseCommitMessage {
-    @Guide(description: "Japanese subject naming what changed and the action taken, ending with a past-tense verb, within 72 characters.")
-    var subject: String
+    @Guide(description: "The main kind of change: add new things, fix a bug, remove things, update behavior, refactor code without changing behavior, rename, move, or improve.")
+    var action: GeneratedCommitAction
 
-    @Guide(description: "Optional Japanese detail the subject does not already state.")
-    var body: String?
+    @Guide(description: "Short Japanese noun phrase describing the feature or behavior the action was applied to, without a verb, a file name, or a trailing period, within 30 characters.")
+    var target: String
 }
 
 @available(macOS 26, *)
@@ -213,25 +348,47 @@ private nonisolated enum AppleIntelligenceCommitMessage {
     ) async -> String? {
         let job = Task.detached(priority: .userInitiated) { () -> String? in
             let model = SystemLanguageModel.default
-            guard model.isAvailable else { return nil }
+            guard model.isAvailable else {
+                suggestionLog.error("model unavailable: \(String(describing: model.availability), privacy: .public)")
+                return nil
+            }
             let session = LanguageModelSession(instructions: instructions)
             session.prewarm()
             let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: 240)
-            do {
-                let subject: String
-                let body: String
+            func generate(_ prompt: String) async throws -> (action: CommitAction, target: String) {
                 switch language {
                 case .english:
-                    let response = try await session.respond(to: prompt, generating: EnglishCommitMessage.self, options: options)
-                    subject = response.content.subject
-                    body = response.content.body ?? ""
+                    let content = try await session.respond(to: prompt, generating: EnglishCommitMessage.self, options: options).content
+                    return (content.action.action, content.target)
                 case .japanese:
-                    let response = try await session.respond(to: prompt, generating: JapaneseCommitMessage.self, options: options)
-                    subject = response.content.subject
-                    body = response.content.body ?? ""
+                    let content = try await session.respond(to: prompt, generating: JapaneseCommitMessage.self, options: options).content
+                    return (content.action.action, content.target)
                 }
-                return CommitMessagePrompt.message(subject: subject, body: body, diff: diff)
+            }
+            do {
+                var (action, target) = try await generate(prompt)
+                // ファイル名を対象にしたときは、機能を言葉で説明するよう1回だけ頼み直す。
+                if let fileName = CommitMessagePrompt.fileNameMentioned(in: target, diff: diff) {
+                    do {
+                        (action, target) = try await generate("""
+                            Do not use the file name "\(fileName)" as the target. \
+                            Describe the feature or behavior that changed in plain words, and write the message again.
+                            """)
+                    } catch {
+                        suggestionLog.error("retry failed: \(String(describing: error), privacy: .public)")
+                    }
+                }
+                guard let subject = CommitMessagePrompt.subject(action: action, target: target, language: language) else {
+                    suggestionLog.error("subject is nil (target became empty after normalization): \(target, privacy: .private)")
+                    return nil
+                }
+                guard let message = CommitMessagePrompt.message(subject: subject, diff: diff) else {
+                    suggestionLog.error("message rejected (looks like diff or copies diff): \(subject, privacy: .private)")
+                    return nil
+                }
+                return message
             } catch {
+                suggestionLog.error("generation failed: \(String(describing: error), privacy: .public)")
                 return nil
             }
         }

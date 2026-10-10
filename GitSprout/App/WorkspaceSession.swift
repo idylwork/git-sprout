@@ -6,6 +6,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
     case discardAllUnstaged
     case discardStaged(FileChange)
     case discardHunk(String)
+    case discardLines(String)
     case dropStash(String)
     case detach(String)
     case deleteBranch(String)
@@ -21,6 +22,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
         case .discardAllUnstaged: return "unstaged-all"
         case .discardStaged(let file): return "staged-\(file.path)"
         case .discardHunk(let patch): return "hunk-\(patch.hashValue)"
+        case .discardLines(let patch): return "lines-\(patch.hashValue)"
         case .dropStash(let ref): return "stash-\(ref)"
         case .detach(let oid): return "detach-\(oid)"
         case .deleteBranch(let name): return "delete-branch-\(name)"
@@ -34,7 +36,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk:
+        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk, .discardLines:
             return String(localized: "Discard Changes?")
         case .dropStash:
             return String(localized: "Drop Stash?")
@@ -63,6 +65,8 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
             return String(localized: "Unstaged changes cannot be undone.")
         case .discardHunk:
             return String(localized: "Changes in the selected hunk cannot be undone.")
+        case .discardLines:
+            return String(localized: "Changes in the selected lines cannot be undone.")
         case .dropStash:
             return String(localized: "A dropped stash cannot be restored.")
         case .detach:
@@ -87,7 +91,7 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
 
     var confirmTitle: String {
         switch self {
-        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk:
+        case .discardUnstaged, .discardAllUnstaged, .discardStaged, .discardHunk, .discardLines:
             return String(localized: "Discard")
         case .dropStash:
             return String(localized: "Drop")
@@ -108,12 +112,25 @@ nonisolated enum ConfirmationRequest: Identifiable, Sendable {
         }
     }
 
+    /// 破壊的影響の大きい操作。赤いボタンにしてキーボードでは実行させない。
     var isDestructive: Bool {
         switch self {
-        case .mergeBranch, .rebaseBranch:
-            return false
-        default:
+        case .pull, .forcePush:
             return true
+        default:
+            return false
+        }
+    }
+
+    /// 強制プル・強制プッシュで上書きされる側 `before` と、上書き後の内容 `after`。
+    var overwrite: (before: String, after: String)? {
+        switch self {
+        case .pull(let name, let upstream, _, _):
+            return (name, upstream)
+        case .forcePush(let branch, _, let upstream):
+            return (upstream, branch)
+        default:
+            return nil
         }
     }
 }
@@ -163,6 +180,16 @@ final class WorkspaceSession {
     var rangePath: String?
     var rangeDiff: DiffDocument?
     var rangeDiffLoading = false
+    /// 強制プル・強制プッシュの前に、上書き前後の二点差分と消えるコミットを見るシート。
+    var overwritePreview: ConfirmationRequest?
+    var overwriteFiles: [PathStatus] = []
+    var overwriteFilesCapped = false
+    var overwriteFilesLoading = false
+    var overwriteLostCommits: [CommitRecord] = []
+    var overwriteLostCommitsCapped = false
+    var overwritePath: String?
+    var overwriteDiff: DiffDocument?
+    var overwriteDiffLoading = false
     var historyFocus: HistoryScrollRequest?
     var commitFiles: [PathStatus] = []
     var commitFilesCapped = false
@@ -241,6 +268,7 @@ final class WorkspaceSession {
     private var searchTicket = 0
     private var commitTicket = 0
     private var rangeTicket = 0
+    private var overwriteTicket = 0
     private var stashTicket = 0
     private var focusToken = 0
     private let watcher = RepoWatcher()
@@ -712,6 +740,85 @@ final class WorkspaceSession {
         }
     }
 
+    func showOverwritePreview(_ confirm: ConfirmationRequest) async {
+        guard let range = confirm.overwrite else { return }
+        overwriteTicket += 1
+        let ticket = overwriteTicket
+        overwritePreview = confirm
+        overwriteFiles = []
+        overwriteFilesCapped = false
+        overwriteLostCommits = []
+        overwriteLostCommitsCapped = false
+        overwritePath = nil
+        overwriteDiff = nil
+        overwriteDiffLoading = false
+        overwriteFilesLoading = true
+        defer { if ticket == overwriteTicket { overwriteFilesLoading = false } }
+        do {
+            let lost = try await client.commits(
+                reachableFrom: range.before,
+                excluding: range.after,
+                limit: GitLimits.pageSize
+            )
+            guard ticket == overwriteTicket else { return }
+            overwriteLostCommits = lost.values
+            overwriteLostCommitsCapped = lost.capped
+            let list = try await client.files(from: range.before, to: range.after, fromMergeBase: false)
+            guard ticket == overwriteTicket else { return }
+            overwriteFiles = list.values
+            overwriteFilesCapped = list.capped
+        } catch {
+            guard ticket == overwriteTicket else { return }
+            report(error)
+        }
+    }
+
+    func dismissOverwritePreview() {
+        guard overwritePreview != nil else { return }
+        closeFileHistory()
+        overwriteTicket += 1
+        overwritePreview = nil
+        overwriteFiles = []
+        overwriteFilesCapped = false
+        overwriteFilesLoading = false
+        overwriteLostCommits = []
+        overwriteLostCommitsCapped = false
+        overwritePath = nil
+        overwriteDiff = nil
+        overwriteDiffLoading = false
+    }
+
+    /// シートを閉じてから、確認済みの強制プル・強制プッシュを実行する。
+    func performOverwritePreview() async {
+        guard let confirm = overwritePreview else { return }
+        dismissOverwritePreview()
+        await perform(confirm)
+    }
+
+    func selectOverwriteFile(_ path: String) async {
+        guard let range = overwritePreview?.overwrite else { return }
+        overwritePath = path
+        overwriteDiffLoading = true
+        let ticket = overwriteTicket
+        defer { if ticket == overwriteTicket { overwriteDiffLoading = false } }
+        do {
+            let original = overwriteFiles.first { $0.path == path }?.originalPath
+            let document = try await client.rangeFileDiff(
+                base: range.before,
+                head: range.after,
+                path: path,
+                originalPath: original,
+                ignoringWhitespace: AppSettings.ignoreWhitespace,
+                fromMergeBase: false
+            )
+            guard ticket == overwriteTicket, overwritePath == path else { return }
+            overwriteDiff = document
+        } catch {
+            guard ticket == overwriteTicket, overwritePath == path else { return }
+            report(error)
+        }
+    }
+
     func refreshBranches() async {
         branchesTicket += 1
         let ticket = branchesTicket
@@ -853,6 +960,20 @@ final class WorkspaceSession {
 
     func confirmDetach(_ oid: String) {
         pendingConfirm = .detach(oid)
+    }
+
+    /// コミットを指すローカルブランチがあればそれに切り替え、なければ切り離して確認を出す。
+    func checkoutCommit(_ commit: CommitRecord) async {
+        let locals = branches.filter { $0.sync != .remoteOnly && $0.oid == commit.oid }
+        guard !locals.isEmpty else {
+            confirmDetach(commit.oid)
+            return
+        }
+        // 今いるブランチがすでにこのコミットにあるなら何もしない
+        guard !locals.contains(where: \.isCurrent) else { return }
+        // 複数あるときは履歴に並ぶ順を優先する
+        let preferred = commit.refs.lazy.compactMap { ref in locals.first { $0.name == ref } }.first
+        await switchBranch((preferred ?? locals[0]).name)
     }
 
     func confirmUndoCommit() {
@@ -1109,7 +1230,7 @@ final class WorkspaceSession {
             await mutate { try await client.discardUnstaged(files) }
         case .discardStaged(let file):
             await mutate { try await client.discardStaged([file]) }
-        case .discardHunk(let patch):
+        case .discardHunk(let patch), .discardLines(let patch):
             await mutate { try await client.apply(patch: patch, cached: false, reverse: true) }
         case .dropStash(let ref):
             await mutate {

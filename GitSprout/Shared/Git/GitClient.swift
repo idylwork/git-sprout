@@ -84,16 +84,18 @@ actor GitClient {
     }
 
     /// `base...head`。merge-base から head までで、プルリクエストの差分と同じ範囲。
+    /// `fromMergeBase` が false のときは `base..head` で、二つのツリーをそのまま比べる。
     func rangeFileDiff(
         base: String,
         head: String,
         path: String,
         originalPath: String? = nil,
-        ignoringWhitespace: Bool = false
+        ignoringWhitespace: Bool = false,
+        fromMergeBase: Bool = true
     ) async throws -> DiffDocument {
         var args = ["diff", "--find-renames", "--no-ext-diff", "--no-color", "-U3"]
         if ignoringWhitespace { args.append("--ignore-all-space") }
-        args.append(contentsOf: ["\(base)...\(head)", "--"])
+        args.append(contentsOf: [fromMergeBase ? "\(base)...\(head)" : "\(base)..\(head)", "--"])
         if let originalPath, originalPath != path {
             args.append(originalPath)
         }
@@ -102,7 +104,7 @@ actor GitClient {
         let oldPath = originalPath ?? document.renameFrom ?? path
         guard !document.truncated, !document.isEmpty else { return document }
         guard ImageFileType.isImage(path) || ImageFileType.isImage(oldPath) else { return document }
-        let fork = try await mergeBase(base, head)
+        let fork = fromMergeBase ? try await mergeBase(base, head) : base
         return try await addingObjectImages(
             document,
             beforeRev: fork,
@@ -209,6 +211,7 @@ actor GitClient {
     }
 
     /// ステージ済み差分のテキスト。要約が先、パッチが後。候補の入力に使う。
+    /// 上限を超えた分は捨てる。候補の入力は先頭だけで足りるので、打ち切りは失敗にしない。
     func stagedDiffText() async throws -> String {
         let stat = try await capture(
             key: "staged-diff-text",
@@ -216,14 +219,18 @@ actor GitClient {
             limit: 8_000,
             preempt: true
         )
-        try requireOK(stat, fallback: String(localized: "Couldn't read the staged changes."))
+        if !stat.truncated {
+            try requireOK(stat, fallback: String(localized: "Couldn't read the staged changes."))
+        }
         let patch = try await capture(
             key: "staged-diff-text",
             args: ["diff", "--cached", "--find-renames", "--no-ext-diff", "--no-color", "-U3"],
             limit: 12_000,
             preempt: true
         )
-        try requireOK(patch, fallback: String(localized: "Couldn't read the staged changes."))
+        if !patch.truncated {
+            try requireOK(patch, fallback: String(localized: "Couldn't read the staged changes."))
+        }
         let summary = String(decoding: stat.stdout, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let changes = String(decoding: patch.stdout, as: UTF8.self)
@@ -270,10 +277,12 @@ actor GitClient {
     }
 
     /// `base...head` で変わったファイル。head 側に無い base の変更は含めない。
-    func files(from base: String, to head: String) async throws -> CappedList<PathStatus> {
+    /// `fromMergeBase` が false のときは `base..head` で、二つのツリーの違いをすべて含める。
+    func files(from base: String, to head: String, fromMergeBase: Bool = true) async throws -> CappedList<PathStatus> {
+        let range = fromMergeBase ? "\(base)...\(head)" : "\(base)..\(head)"
         let output = try await capture(
             key: "commit-files",
-            args: ["diff", "--find-renames", "--name-status", "-z", "\(base)...\(head)"],
+            args: ["diff", "--find-renames", "--name-status", "-z", range],
             limit: GitLimits.listByteLimit,
             preempt: true
         )
@@ -921,6 +930,23 @@ actor GitClient {
 
     func fileParentDiff(rev: String, path: String, ignoringWhitespace: Bool = false) async throws -> DiffDocument {
         try await showFileDiff(oid: rev, path: path, ignoringWhitespace: ignoringWhitespace)
+    }
+
+    /// `head` から辿れて `base` からは辿れないコミット。新しい順。
+    func commits(reachableFrom head: String, excluding base: String, limit: Int) async throws -> CappedList<CommitRecord> {
+        let output = try await capture(
+            key: "range-commits",
+            args: [
+                "log", "--date-order", "-n", "\(limit + 1)",
+                "--pretty=format:\(Self.logFormat)", "--decorate=full",
+                "\(base)..\(head)", "--"
+            ],
+            limit: GitLimits.listByteLimit,
+            preempt: true
+        )
+        try requireOK(output, fallback: String(localized: "Couldn't read the history."))
+        let commits = await Self.parse(output.stdout) { GitLogParser.parse($0) }
+        return CappedList(values: Array(commits.prefix(limit)), capped: commits.count > limit)
     }
 
     func searchCommits(query: String) async throws -> CappedList<CommitRecord> {

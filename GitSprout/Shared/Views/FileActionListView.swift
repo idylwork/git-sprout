@@ -499,6 +499,7 @@ struct FileDiffPane: View {
     var onPrimaryHunk: ((DiffHunk) -> Void)?
     var onSecondaryHunk: ((DiffHunk) -> Void)?
     var onStageLines: ((String) -> Void)?
+    var onDiscardLines: ((String) -> Void)? = nil
     var onFixMissingNewline: (() -> Void)? = nil
 
     var body: some View {
@@ -539,6 +540,7 @@ struct FileDiffPane: View {
                 onPrimary: onPrimaryHunk,
                 onSecondary: onSecondaryHunk,
                 onStageLines: onStageLines,
+                onDiscardLines: onDiscardLines,
                 onFixMissingNewline: onFixMissingNewline
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)

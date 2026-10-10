@@ -20,6 +20,7 @@ struct ContentView: View {
             )
         ) {
             Button("OK", role: .cancel) {}
+                .keyboardShortcut(.defaultAction)
         } message: {
             Text(model.openError ?? "")
         }

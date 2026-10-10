@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 struct ChangesView: View {
     var session: WorkspaceSession
@@ -310,6 +311,8 @@ private struct CommitComposer: View {
         } catch is CancellationError, is GitCancelled {
             return
         } catch {
+            // エラー文に差分の中身が入ることがあるので、本文は private にする
+            suggestionLog.error("stagedDiffText failed: \(String(describing: type(of: error)), privacy: .public): \(String(describing: error), privacy: .private)")
             failure = (error as? GitFailure)?.message ?? error.localizedDescription
         }
     }
@@ -407,6 +410,9 @@ struct ChangesDiffView: View {
             onStageLines: file == nil ? nil : { patch in
                 Task { await session.stageLines(patch) }
             },
+            onDiscardLines: file?.staged == false ? { patch in
+                session.pendingConfirm = .discardLines(patch)
+            } : nil,
             onFixMissingNewline: file == nil ? nil : {
                 guard let file else { return }
                 Task { await session.appendTrailingNewline(path: file.path, staged: file.staged) }
